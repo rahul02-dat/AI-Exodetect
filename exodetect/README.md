@@ -1,16 +1,31 @@
-# React + Vite
+# ExoDetect — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Interactive React dashboard for the ExoDetect transit detection pipeline. Built with **React 19** and **Vite 8**, using the Canvas API for high-performance scientific visualisations.
 
-Currently, two official plugins are available:
+## Setup
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm install
+npm run dev
+```
 
-## React Compiler
+## Scripts
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+| Command           | Description                    |
+|-------------------|--------------------------------|
+| `npm run dev`     | Start dev server (port 5173)   |
+| `npm run build`   | Production build to `dist/`    |
+| `npm run preview` | Preview production build       |
+| `npm run lint`    | Run ESLint                     |
 
-## Expanding the ESLint configuration
+## Key Components
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- **LightCurveCanvas** — Renders the TESS light curve with interactive crosshair hover
+- **PhaseFoldedCanvas** — Phase-folded transit view on the best-fit period
+- **PeriodogramCanvas** — BLS periodogram with peak period annotation
+- **PipelineStatus** — Animated step-by-step pipeline progress indicator
+- **ConfBar** — Confidence bar for AI classification probabilities
+
+## Backend Dependency
+
+This frontend requires the Flask backend (`server.py` in the project root) to be running on `http://localhost:8000`. See the [root README](../README.md) for setup instructions.

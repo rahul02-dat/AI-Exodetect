@@ -372,7 +372,7 @@ export default function App() {
               border:"1.5px solid #00D4FF55", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>◎</div>
             <div>
               <div style={{ fontSize:15, fontWeight:700, letterSpacing:0.5 }}>EXODETECT</div>
-              <div style={{ fontSize:10, color:COLORS.slate, fontFamily:"Space Mono, monospace", letterSpacing:1 }}>REAL TESS DATA · AI PIPELINE</div>
+              <div style={{ fontSize:10, color:COLORS.slate, fontFamily:"Space Mono, monospace", letterSpacing:1 }}>AI-Enabled Exoplanet Detection</div>
             </div>
           </div>
 
@@ -449,7 +449,7 @@ export default function App() {
           <div style={{ background:COLORS.panel, border:"1px solid #0E2040", borderRadius:12,
             padding:"40px 20px", textAlign:"center", marginBottom:16 }}>
             <div style={{ fontSize:36, marginBottom:12 }}>◎</div>
-            <div style={{ color:COLORS.white, fontSize:15, fontWeight:600, marginBottom:6 }}>Ready to scan real TESS data</div>
+            <div style={{ color:COLORS.white, fontSize:15, fontWeight:600, marginBottom:6 }}>Ready to scan TESS data</div>
             <div style={{ color:COLORS.slate, fontSize:12, fontFamily:"Space Mono, monospace", marginBottom:20 }}>
               Select a target above, then click RUN SCAN to fetch live data from the MAST archive
             </div>

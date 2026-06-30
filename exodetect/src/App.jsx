@@ -296,14 +296,34 @@ export default function App() {
   const [hoveredX, setHoveredX]     = useState(null);
   const [backendOk, setBackendOk]   = useState(null);
 
+  // Track window width for responsive layout
+  const [winWidth, setWinWidth] = useState(typeof window !== "undefined" ? window.innerWidth : 1200);
+  useEffect(() => {
+    const onResize = () => setWinWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const isMobile = winWidth < 500;
+  const isTablet = winWidth < 700;
+
   const containerRef = useRef(null);
   const [canvasWidth, setCanvasWidth] = useState(700);
 
+  // Track phase/periodogram container widths independently
+  const smallCanvasRef = useRef(null);
+  const [smallCanvasWidth, setSmallCanvasWidth] = useState(300);
+
   useEffect(() => {
-    const obs = new ResizeObserver(([e]) => setCanvasWidth(Math.max(300, e.contentRect.width)));
+    const obs = new ResizeObserver(([e]) => setCanvasWidth(Math.max(200, e.contentRect.width)));
     if (containerRef.current) obs.observe(containerRef.current);
     return () => obs.disconnect();
   }, []);
+
+  useEffect(() => {
+    const obs = new ResizeObserver(([e]) => setSmallCanvasWidth(Math.max(150, e.contentRect.width)));
+    if (smallCanvasRef.current) obs.observe(smallCanvasRef.current);
+    return () => obs.disconnect();
+  }, [result]);
 
   // Health check
   useEffect(() => {
@@ -351,21 +371,24 @@ export default function App() {
   const topMeta = cls ? (CLASS_META[cls.top_class] || { icon:"?", color:COLORS.cyan }) : null;
 
   return (
-    <div style={{ minHeight:"100vh", background:COLORS.bg, color:COLORS.white,
-      fontFamily:"Inter, system-ui, sans-serif", paddingBottom:40 }}>
+    <div style={{ minHeight:"100vh", width:"100vw", background:COLORS.bg, color:COLORS.white,
+      fontFamily:"Inter, system-ui, sans-serif", paddingBottom:40, overflowX:"hidden" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;700&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
+        html,body{margin:0;padding:0;width:100%;overflow-x:hidden}
         @keyframes pulse{0%,100%{box-shadow:0 0 6px #00D4FF}50%{box-shadow:0 0 18px #00D4FF}}
         @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
         ::-webkit-scrollbar{width:6px}
         ::-webkit-scrollbar-track{background:#050B1A}
         ::-webkit-scrollbar-thumb{background:#0E2040;border-radius:3px}
+        html{font-size:16px}
+        @media(max-width:600px){html{font-size:14px}}
       `}</style>
 
       {/* Header */}
-      <div style={{ borderBottom:"1px solid #0E2040", background:"linear-gradient(180deg,#080F20,#050B1A)", padding:"0 24px" }}>
-        <div style={{ maxWidth:1200, margin:"0 auto", display:"flex", alignItems:"center", justifyContent:"space-between", height:60 }}>
+      <div style={{ borderBottom:"1px solid #0E2040", background:"linear-gradient(180deg,#080F20,#050B1A)", padding: isMobile ? "0 12px" : "0 32px" }}>
+        <div style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", height: isMobile ? "auto" : 60, flexWrap:"wrap", gap: isMobile ? 8 : 0, padding: isMobile ? "10px 0" : 0 }}>
           <div style={{ display:"flex", alignItems:"center", gap:12 }}>
             <div style={{ width:32, height:32, borderRadius:"50%",
               background:"radial-gradient(circle at 35% 35%, #00D4FF33, #050B1A)",
@@ -403,7 +426,7 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{ maxWidth:1200, margin:"0 auto", padding:"20px 24px 0" }}>
+      <div style={{ width:"100%", padding: isMobile ? "12px 12px 0" : "20px 32px 0" }}>
 
         {/* Target selector */}
         <div style={{ display:"flex", gap:8, marginBottom:18, flexWrap:"wrap", alignItems:"center" }}>
@@ -465,7 +488,7 @@ export default function App() {
 
         {/* Main layout */}
         {(result || loading) && (
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 290px", gap:16, alignItems:"start" }}>
+          <div style={{ display:"grid", gridTemplateColumns: isTablet ? "1fr" : "1fr 290px", gap:16, alignItems:"start" }}>
 
             {/* Left column */}
             <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
@@ -494,7 +517,7 @@ export default function App() {
                   ) : (
                     <div style={{ height:220, display:"flex", alignItems:"center", justifyContent:"center",
                       color:COLORS.slate, fontSize:12, fontFamily:"Space Mono, monospace" }}>
-                      {loading ? "Downloading light curve…" : "—"}
+                      {loading ? "Fetching light curve…" : "—"}
                     </div>
                   )}
                 </div>
@@ -518,16 +541,16 @@ export default function App() {
               </div>
 
               {/* Phase-fold + periodogram */}
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
+              <div style={{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap:16 }}>
                 {["Phase-Folded Transit","BLS Periodogram"].map((title, idx) => (
-                  <div key={title} style={{ background:COLORS.panel, border:"1px solid #0E2040", borderRadius:12, overflow:"hidden" }}>
+                  <div key={title} ref={idx === 0 ? smallCanvasRef : undefined} style={{ background:COLORS.panel, border:"1px solid #0E2040", borderRadius:12, overflow:"hidden" }}>
                     <div style={{ padding:"9px 13px", borderBottom:"1px solid #0E2040",
                       fontSize:10, color:COLORS.slate, fontFamily:"Space Mono, monospace" }}>{title}</div>
                     <div style={{ padding:8 }}>
                       {result ? (
                         idx === 0
-                          ? <PhaseFoldedCanvas width={canvasWidth/2 - 40} height={140} data={result.phase_folded} />
-                          : <PeriodogramCanvas width={canvasWidth/2 - 40} height={140} data={result.bls} />
+                          ? <PhaseFoldedCanvas width={smallCanvasWidth - 16} height={140} data={result.phase_folded} />
+                          : <PeriodogramCanvas width={smallCanvasWidth - 16} height={140} data={result.bls} />
                       ) : (
                         <div style={{ height:140, display:"flex", alignItems:"center", justifyContent:"center",
                           color:COLORS.slate, fontSize:11, fontFamily:"Space Mono, monospace" }}>

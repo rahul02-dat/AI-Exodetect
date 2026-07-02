@@ -24,9 +24,7 @@ An end-to-end web application that fetches **real TESS satellite data** from NAS
 Exodetect/
 ├── server.py                 # Flask backend — TESS data pipeline & CNN inference
 ├── exodetect_cnn.pt          # Exported PyTorch model weights (generated after training)
-├── fix_and_rebuild.py        # Data pipeline script to download and build dataset.npz
-├── train_model.py            # Script to train the dual-branch CNN locally
-├── ExoDetect_Phase1_CNN.ipynb# Original Jupyter notebook for exploratory data analysis
+├── ExoDetect_Phase1_CNN.ipynb# Jupyter notebook for training the CNN 
 ├── data/
 │   └── kepler_lcs/           # Directory for Kepler DR25 training data
 ├── env/                      # Python virtual environment (not tracked)
@@ -68,7 +66,6 @@ pip install flask flask-cors numpy lightkurve astropy scikit-learn torch pandas 
 If you want to train the model from scratch using the Kepler dataset:
 ```bash
 # 1. Download light curves and build dataset.npz
-python fix_and_rebuild.py
 
 # 2. Train the CNN and export exodetect_cnn.pt
 python train_model.py

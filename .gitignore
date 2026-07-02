@@ -14,6 +14,7 @@ dist-ssr/
 .env
 .env.local
 .env.*.local
+*.pt
 
 # Logs
 *.log
@@ -22,6 +23,8 @@ npm-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+data
+*.mov
 
 # Editor config
 .vscode/

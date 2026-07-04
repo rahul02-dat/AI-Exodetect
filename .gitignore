@@ -19,6 +19,7 @@ dist-ssr/
 # Logs
 *.log
 npm-debug.log*
+*.rdb
 
 # OS files
 .DS_Store

@@ -55,7 +55,7 @@ def _fetch_light_curve(target_name):
 
     # BLS for initial parameter estimates
     bls      = BoxLeastSquares(time, flux, ferr)
-    periods  = np.linspace(0.5, 27.0, 5000)
+    periods  = np.linspace(0.51, 27.0, 5000)
     durations = np.linspace(0.01, 0.4, 20)
     power    = bls.power(periods, durations)
     best_idx = np.argmax(power.power)

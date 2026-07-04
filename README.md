@@ -90,7 +90,7 @@ cp data/kepler_lcs/exodetect_cnn.pt ./exodetect_cnn.pt
 
 Start the Flask API:
 ```bash
-./env/bin/python server.py
+python server.py
 ```
 The API will be available at `http://localhost:8000`. You should see `[INFO] CNN model loaded` in the console.
 

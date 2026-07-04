@@ -9,6 +9,9 @@ Requires Redis running locally:
     brew services start redis
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from celery import Celery
 import numpy as np
 import lightkurve as lk
@@ -17,15 +20,13 @@ from mcmc_fitter import run_mcmc
 import warnings, traceback
 warnings.filterwarnings("ignore")
 
-# ── Celery app ─────────────────────────────────────────────────────────────
-# Redis as both broker and result backend
 celery_app = Celery(
     "exodetect",
     broker="redis://localhost:6379/0",
     backend="redis://localhost:6379/0",
 )
-
 celery_app.conf.update(
+    task_default_queue="mcmc",
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],

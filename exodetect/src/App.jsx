@@ -251,16 +251,27 @@ export default function App(){
       try{
         const r=await fetch(`${API}/batch/status?job_id=${jobId}`);
         const d=await r.json();
-        setBatchState(d.state);setBatchStep(d.step||"");setBatchPct(d.pct||0);
+        setBatchState(d.state);
+        setBatchStep(d.step||"");
+        setBatchPct(d.pct||0);
         if(d.state==="SUCCESS"){
           clearInterval(batchPoll.current);
           const r2=await fetch(`${API}/batch/results?job_id=${jobId}`);
           const d2=await r2.json();
-          if(d2.status==="ok")setBatchResult(d2.data);
+          if(d2.status==="ok") setBatchResult(d2.data);
+          else setBatchError(d2.error||"Failed to load results");
           setBatchLoading(false);
         }
-        if(d.state==="FAILURE"){clearInterval(batchPoll.current);setBatchLoading(false);}
-      }catch{clearInterval(batchPoll.current);setBatchLoading(false);}
+        if(d.state==="FAILURE"){
+          clearInterval(batchPoll.current);
+          setBatchError(d.message||"Worker task failed — check Celery terminal");
+          setBatchLoading(false);
+        }
+      }catch(e){
+        clearInterval(batchPoll.current);
+        setBatchError("Cannot reach backend at "+API+" — is the server running on port 8000?");
+        setBatchLoading(false);
+      }
     },2000);
   },[]);
 

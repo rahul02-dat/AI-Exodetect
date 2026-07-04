@@ -26,6 +26,10 @@ npm-debug.log*
 Thumbs.db
 data
 *.mov
+*.png
+*.pdf
+*.jpeg
+*.jpg
 
 # Editor config
 .vscode/

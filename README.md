@@ -1,21 +1,19 @@
-# ◎ ExoDetect — AI-Powered Exoplanet Transit Detection
+# ◎ ExoDetect — AI-Powered Exoplanet Transit Detection & Analysis
 
-An end-to-end web application that fetches **real TESS satellite data** from NASA's MAST archive, runs a Box Least Squares (BLS) periodogram to detect periodic transit signals, and classifies them using a **Dual-Branch 1D Convolutional Neural Network (CNN)** built with PyTorch — all visualised through an interactive dark-mode dashboard.
+An end-to-end web application that fetches **real TESS satellite data** from NASA's MAST archive, runs a Box Least Squares (BLS) periodogram to detect periodic transit signals, and classifies them using an **Ensemble Model (Dual-Branch 1D CNN + TransitFormer)** built with PyTorch. It features an interactive dark-mode dashboard, Explainable AI (XAI) attention heatmaps, automated full-sector batch processing, async MCMC parameter fitting, and downloadable PDF reports.
 
 ---
 
 ## ✨ Features
 
-- **Real TESS Data** — Fetches 2-minute cadence PDCSAP light curves via `lightkurve` from the MAST archive
-- **BLS Periodogram** — Searches a grid of 5,000 trial periods (0.5–27 days) to identify the strongest periodic signal
-- **Dual-Branch 1D CNN** — Uses a custom PyTorch CNN (trained on Kepler DR25 TCE data) processing both global (full period) and local (zoomed) transit views to classify signals with high precision
-- **Transit Parameter Estimation** — Extracts orbital period, transit depth, duration, epoch (T₀), Rp/R★, SNR, and transit count
-- **Phase-Folded View** — Folds the light curve on the best-fit period to visually confirm the transit shape
-- **AI Classification** — The CNN distinguishes Exoplanet Transits from False Positives (Eclipsing Binaries, Stellar Blends, Starspots)
-- **MCMC Parameter Fitting** — Runs a full Markov Chain Monte Carlo (MCMC) using `emcee` to sample transit parameters and generate posteriors
-- **Data Quality Metrics** — Reports completeness, CDPP noise, and systematic noise levels
-- **Live Backend Status** — Frontend displays real-time connection status to the Flask backend
-- **Interactive Light Curve** — Canvas-rendered plot with crosshair hover showing time and flux values
+- **Real TESS Data Retrieval** — Fetches 2-minute cadence PDCSAP light curves via `lightkurve` from the MAST archive.
+- **BLS Periodogram Search** — Searches a grid of 5,000 trial periods (0.51–27 days) to identify the strongest periodic signal.
+- **AI Ensemble Classification** — Soft-votes between a **Dual-Branch 1D CNN** (Kepler-trained) and a **TransitFormer** (1D Patch-based Transformer) to classify signals into Exoplanet Transits or False Positives (Eclipsing Binaries, Stellar Blends, Starspots).
+- **Explainable AI (XAI)** — Displays a visual attention heatmap of the `TransitFormer`'s self-attention weights to explain what regions of the light curve drove its classification.
+- **Async MCMC Parameter Fitting** — Runs a full Markov Chain Monte Carlo (MCMC) using `emcee` to sample transit parameters (Period, Rp/R★, Inc, a/R★) and generate posteriors.
+- **Full TESS Sector Batch Processing** — Automatically downloads target lists from MAST for a given sector, scans them concurrently using the ensemble, and logs candidates.
+- **PDF Report Generation** — Dynamically generates professional PDF analysis reports (with phase-folded light curves, BLS power, and MCMC parameter statistics) for individual candidates or full-sector batches.
+- **Live Backend Status & Device Detection** — Real-time backend connectivity check and automatic device mapping (MPS for Apple Silicon, CUDA for Nvidia, CPU fallback).
 
 ---
 
@@ -23,17 +21,21 @@ An end-to-end web application that fetches **real TESS satellite data** from NAS
 
 ```
 Exodetect/
-├── server.py                 # Flask backend — TESS data pipeline & CNN inference
-├── tasks.py                  # Celery worker for async MCMC fitting
+├── server.py                 # Flask backend — API endpoints & ensemble inference
+├── tasks.py                  # Celery tasks for async MCMC fitting (DB 0)
+├── batch_pipeline.py         # Celery tasks for async full-sector scanning (DB 1)
+├── transit_transformer.py    # TransitFormer model architecture & ExoEnsemble
+├── train_transformer.py      # TransitFormer training script with early stopping & AUC logging
+├── report_generator.py       # PDF generator using ReportLab and Matplotlib
 ├── mcmc_fitter.py            # MCMC transit modeling using emcee and batman
-├── exodetect_cnn.pt          # Exported PyTorch model weights (generated after training)
-├── ExoDetect_Phase1_CNN.ipynb# Jupyter notebook for training the CNN 
+├── exodetect_cnn.pt          # Exported PyTorch CNN weights
+├── exodetect_transformer.pt  # Exported PyTorch TransitFormer weights
 ├── data/
-│   └── kepler_lcs/           # Directory for Kepler DR25 training data
+│   └── kepler_lcs/           # Directory for training data (dataset.npz)
 ├── env/                      # Python virtual environment (not tracked)
 └── exodetect/                # React + Vite frontend
     ├── src/
-    │   ├── App.jsx           # Main application component
+    │   ├── App.jsx           # Main dashboard UI
     │   ├── main.jsx          # React entry point
     │   └── index.css
     ├── package.json
@@ -48,7 +50,7 @@ Exodetect/
 
 - **Python 3.10+** with `pip`
 - **Node.js 18+** with `npm`
-- **Redis** (required for async MCMC background tasks)
+- **Redis** (required for Celery task queuing)
 
 ### 1. Clone the Repository
 
@@ -62,7 +64,7 @@ cd AI-Exodetect
 ```bash
 python3 -m venv env
 source env/bin/activate        # macOS/Linux
-pip install flask flask-cors numpy lightkurve astropy scikit-learn torch pandas scipy celery redis emcee batman-package corner
+pip install flask flask-cors numpy lightkurve astropy scikit-learn torch pandas scipy celery redis emcee batman-package corner reportlab matplotlib
 ```
 
 Ensure Redis is installed and running:
@@ -72,32 +74,32 @@ brew install redis
 brew services start redis
 ```
 
-### 3. (Optional) Train the CNN Model
+### 3. Train the TransitFormer Model (Optional)
 
-If you want to train the model from scratch using the Kepler dataset:
+To train the new attention-based `TransitFormer` on the local Kepler dataset:
 ```bash
-# 1. Download light curves and build dataset.npz
-
-# 2. Train the CNN and export exodetect_cnn.pt
-python train_model.py
-
-# 3. Ensure the model is in the root directory for the server
-cp data/kepler_lcs/exodetect_cnn.pt ./exodetect_cnn.pt
+python train_transformer.py
 ```
-*(If `exodetect_cnn.pt` is not found, the backend automatically falls back to a basic heuristic classifier).*
+This saves `exodetect_transformer.pt` and outputs a training curve plot to `transformer_training.png`.
 
-### 4. Start the Backend Server
+### 4. Start the Services
 
-Start the Flask API:
+#### A. Start the Flask API:
 ```bash
 python server.py
 ```
-The API will be available at `http://localhost:8000`. You should see `[INFO] CNN model loaded` in the console.
+The API starts on `http://localhost:8000`. You should see output confirming both the CNN and TransitFormer models were loaded successfully on your device (e.g. `mps` for Apple Silicon).
 
-Open a new terminal, activate the environment, and start the Celery worker for MCMC processing:
+#### B. Start the MCMC Worker:
+Open a new terminal tab and run:
 ```bash
-source env/bin/activate
-celery -A tasks worker --loglevel=info --concurrency=2
+./env/bin/celery -A tasks worker --loglevel=info --concurrency=2
+```
+
+#### C. Start the Batch Sector Worker:
+Open a new terminal tab and run:
+```bash
+./env/bin/celery -A batch_pipeline worker --loglevel=info --concurrency=2
 ```
 
 ### 5. Set Up the React Frontend
@@ -109,27 +111,26 @@ npm install
 npm run dev
 ```
 
-The frontend will be available at `http://localhost:5173`.
+The frontend dashboard will be available at `http://localhost:5173`.
 
 ---
 
 ## 🔌 API Endpoints
 
-| Method | Endpoint          | Description                               |
-|--------|-------------------|-------------------------------------------|
-| GET    | `/api/health`     | Backend health check                      |
-| GET    | `/api/model-info` | Returns information about the loaded CNN  |
-| GET    | `/api/targets`    | List of pre-configured stellar targets    |
-| GET    | `/api/analyse`    | Run full pipeline on a target (`?target=`) |
-| POST   | `/api/mcmc/start` | Start an async MCMC fitting job           |
-| GET    | `/api/mcmc/status`| Poll progress of an MCMC job (`?job_id=`) |
-| GET    | `/api/mcmc/result`| Fetch completed MCMC results (`?job_id=`) |
-
-### Example
-
-```bash
-curl "http://localhost:8000/api/analyse?target=L%2098-59"
-```
+| Method | Endpoint              | Description                                          |
+|--------|-----------------------|------------------------------------------------------|
+| GET    | `/api/health`         | Backend health check                                 |
+| GET    | `/api/model-info`     | Returns active models (Ensemble, CNN, TF) & device   |
+| GET    | `/api/targets`        | Pre-configured stellar targets                       |
+| GET    | `/api/analyse`        | Run full analysis pipeline on a target (`?target=`)  |
+| POST   | `/api/mcmc/start`     | Start an async MCMC fitting job                      |
+| GET    | `/api/mcmc/status`    | Poll progress of an MCMC job (`?job_id=`)            |
+| GET    | `/api/mcmc/result`    | Fetch completed MCMC results (`?job_id=`)            |
+| POST   | `/api/batch/start`    | Start a sector batch scan (`sector`, `max_targets`)  |
+| GET    | `/api/batch/status`   | Poll sector scan progress (`?job_id=`)               |
+| GET    | `/api/batch/results`  | Fetch results of a batch scan (`?job_id=`)           |
+| GET    | `/api/report/candidate`| Download dynamic PDF candidate report (`?target=`)  |
+| GET    | `/api/report/sector`  | Download dynamic PDF sector summary (`?job_id=`)     |
 
 ---
 
@@ -142,21 +143,19 @@ curl "http://localhost:8000/api/analyse?target=L%2098-59"
 | WASP-18          | Exoplanet Transit    | Hot Jupiter, ~1 day period         |
 | TIC 286923464    | Exoplanet Transit    | HD 118203 b — eccentric orbit      |
 | HD 21749         | Exoplanet Transit    | Sub-Neptune + super-Earth          |
-| Beta Pictoris    | Stellar Variability  | Debris disk + direct imaging planet|
-
-> You can also type any valid TIC ID or star name in the search bar.
 
 ---
 
 ## 🛠️ Tech Stack
 
-| Layer     | Technology                                        |
-|-----------|---------------------------------------------------|
-| Frontend  | React 19, Vite 8, Canvas API                      |
-| Backend   | Flask, Flask-CORS, Celery, Redis                  |
-| Machine Learning | PyTorch, Scikit-Learn, Pandas              |
-| Astrophysics | lightkurve, Astropy, emcee, batman, NumPy      |
-| Source    | NASA TESS / MAST Archive & Kepler DR25 Catalog    |
+| Layer     | Technology                                              |
+|-----------|---------------------------------------------------------|
+| Frontend  | React 19, Vite 8, HTML Canvas API                      |
+| Backend   | Flask, Flask-CORS, Celery, Redis                        |
+| Deep Learning | PyTorch, TransitFormer, 1D CNN                      |
+| Astrophysics | lightkurve, Astropy, emcee, batman                   |
+| Reporting | ReportLab, Matplotlib                                   |
+| Source    | NASA TESS / MAST Archive & Kepler DR25 Catalog          |
 
 ---
 

@@ -12,6 +12,7 @@ An end-to-end web application that fetches **real TESS satellite data** from NAS
 - **Transit Parameter Estimation** — Extracts orbital period, transit depth, duration, epoch (T₀), Rp/R★, SNR, and transit count
 - **Phase-Folded View** — Folds the light curve on the best-fit period to visually confirm the transit shape
 - **AI Classification** — The CNN distinguishes Exoplanet Transits from False Positives (Eclipsing Binaries, Stellar Blends, Starspots)
+- **MCMC Parameter Fitting** — Runs a full Markov Chain Monte Carlo (MCMC) using `emcee` to sample transit parameters and generate posteriors
 - **Data Quality Metrics** — Reports completeness, CDPP noise, and systematic noise levels
 - **Live Backend Status** — Frontend displays real-time connection status to the Flask backend
 - **Interactive Light Curve** — Canvas-rendered plot with crosshair hover showing time and flux values
@@ -23,6 +24,8 @@ An end-to-end web application that fetches **real TESS satellite data** from NAS
 ```
 Exodetect/
 ├── server.py                 # Flask backend — TESS data pipeline & CNN inference
+├── tasks.py                  # Celery worker for async MCMC fitting
+├── mcmc_fitter.py            # MCMC transit modeling using emcee and batman
 ├── exodetect_cnn.pt          # Exported PyTorch model weights (generated after training)
 ├── ExoDetect_Phase1_CNN.ipynb# Jupyter notebook for training the CNN 
 ├── data/
@@ -45,6 +48,7 @@ Exodetect/
 
 - **Python 3.10+** with `pip`
 - **Node.js 18+** with `npm`
+- **Redis** (required for async MCMC background tasks)
 
 ### 1. Clone the Repository
 
@@ -58,7 +62,14 @@ cd AI-Exodetect
 ```bash
 python3 -m venv env
 source env/bin/activate        # macOS/Linux
-pip install flask flask-cors numpy lightkurve astropy scikit-learn torch pandas scipy
+pip install flask flask-cors numpy lightkurve astropy scikit-learn torch pandas scipy celery redis emcee batman-package corner
+```
+
+Ensure Redis is installed and running:
+```bash
+# On macOS
+brew install redis
+brew services start redis
 ```
 
 ### 3. (Optional) Train the CNN Model
@@ -77,11 +88,17 @@ cp data/kepler_lcs/exodetect_cnn.pt ./exodetect_cnn.pt
 
 ### 4. Start the Backend Server
 
+Start the Flask API:
 ```bash
 ./env/bin/python server.py
 ```
-
 The API will be available at `http://localhost:8000`. You should see `[INFO] CNN model loaded` in the console.
+
+Open a new terminal, activate the environment, and start the Celery worker for MCMC processing:
+```bash
+source env/bin/activate
+celery -A tasks worker --loglevel=info --concurrency=2
+```
 
 ### 5. Set Up the React Frontend
 
@@ -104,6 +121,9 @@ The frontend will be available at `http://localhost:5173`.
 | GET    | `/api/model-info` | Returns information about the loaded CNN  |
 | GET    | `/api/targets`    | List of pre-configured stellar targets    |
 | GET    | `/api/analyse`    | Run full pipeline on a target (`?target=`) |
+| POST   | `/api/mcmc/start` | Start an async MCMC fitting job           |
+| GET    | `/api/mcmc/status`| Poll progress of an MCMC job (`?job_id=`) |
+| GET    | `/api/mcmc/result`| Fetch completed MCMC results (`?job_id=`) |
 
 ### Example
 
@@ -133,9 +153,9 @@ curl "http://localhost:8000/api/analyse?target=L%2098-59"
 | Layer     | Technology                                        |
 |-----------|---------------------------------------------------|
 | Frontend  | React 19, Vite 8, Canvas API                      |
-| Backend   | Flask, Flask-CORS                                 |
+| Backend   | Flask, Flask-CORS, Celery, Redis                  |
 | Machine Learning | PyTorch, Scikit-Learn, Pandas              |
-| Astrophysics | lightkurve, Astropy (BoxLeastSquares), NumPy   |
+| Astrophysics | lightkurve, Astropy, emcee, batman, NumPy      |
 | Source    | NASA TESS / MAST Archive & Kepler DR25 Catalog    |
 
 ---

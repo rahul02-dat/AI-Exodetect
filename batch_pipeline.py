@@ -236,11 +236,11 @@ def _process_one(target_str, sector, models):
     Returns a result dict. Never raises — returns error dict on failure.
     """
     try:
-        search_kw = {"mission": "TESS", "author": "SPOC"}
-        if sector:
-            search_kw["sector"] = sector
+        # search_kw = {"mission": "TESS", "author": "SPOC"}
+        # if sector:
+        #     search_kw["sector"] = sector
 
-        search = lk.search_lightcurve(target_str, **search_kw)
+        search = lk.search_lightcurve(target_str, mission="TESS", author="SPOC")
         if len(search) == 0:
             search = lk.search_lightcurve(target_str, mission="TESS")
         if len(search) == 0:
@@ -259,7 +259,7 @@ def _process_one(target_str, sector, models):
 
         # BLS
         bls     = BoxLeastSquares(time_arr, flux_arr, ferr_arr)
-        periods = np.linspace(0.5, 27.0, 3000)
+        periods = np.linspace(0.6, 27.0, 3000)
         power   = bls.power(periods, np.linspace(0.05, 0.5, 15))
         bi      = np.argmax(power.power)
         period  = float(power.period[bi])
@@ -373,6 +373,7 @@ def run_sector(self, sector_number, max_targets=10):
         # Sort by P(planet) descending
         ok_results = [r for r in results if r.get("status") == "ok"]
         ok_results.sort(key=lambda x: x.get("p_planet", 0), reverse=True)
+        failed = [r for r in results if r.get("status") != "ok"]
 
         self.update_state(state="PROGRESS",
                           meta={"step": "Finalising results…", "pct": 97,
@@ -384,7 +385,7 @@ def run_sector(self, sector_number, max_targets=10):
             "successful":       len(ok_results),
             "candidates":       len(candidates),
             "errors":           errors,
-            "top_candidates":   ok_results,       # ALL ok results, sorted
+            "top_candidates":   ok_results + failed,       # ALL ok results, sorted
             "status":           "done",
         }
 

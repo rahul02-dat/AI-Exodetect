@@ -679,7 +679,7 @@ export default function App(){
                           </thead>
                           <tbody>
                             {(batchResult.top_candidates||[]).map((r,i)=>(
-                              <tr key={i} style={{borderBottom:"1px solid #0E2040",background:i%2===0?"transparent":"#060E1E",opacity:r.status==="ok"?1:0.4}}>
+                              <tr key={i} style={{borderBottom:"1px solid #0E2040",background:i%2===0?"transparent":"#060E1E",opacity:r.status==="ok"? (r.message || r.status) : ""}}>
                                 <td style={{padding:"7px 10px",color:COLORS.white}}>{r.tic_id}</td>
                                 <td style={{padding:"7px 10px",color:r.p_planet>0.7?COLORS.green:r.p_planet>0.4?COLORS.amber:COLORS.red,fontWeight:700}}>{r.p_planet?(r.p_planet*100).toFixed(1)+"%":"—"}</td>
                                 <td style={{padding:"7px 10px",color:COLORS.cyan}}>{r.period_days?.toFixed(3)}d</td>

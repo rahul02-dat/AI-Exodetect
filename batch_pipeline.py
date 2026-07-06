@@ -91,11 +91,11 @@ def _get_worker_models():
     class ExoDetectCNN(nn.Module):
         def __init__(self, global_len=201, local_len=81, n_stellar=4):
             super().__init__()
-            self.gb = nn.Sequential(
+            self.global_branch = nn.Sequential(
                 ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
                 ConvBlock(32,64,5,2), ConvBlock(64,128,3,2),
                 SafeAdaptiveAvgPool1d(8), nn.Flatten())
-            self.lb = nn.Sequential(
+            self.local_branch = nn.Sequential(
                 ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
                 ConvBlock(32,64,3,2), SafeAdaptiveAvgPool1d(4), nn.Flatten())
             fused = (128*8) + (64*4) + n_stellar
@@ -104,7 +104,7 @@ def _get_worker_models():
                 nn.Linear(512,256),   nn.ReLU(True), nn.Dropout(0.3),
                 nn.Linear(256,2))
         def forward(self, gv, lv, sf):
-            return self.head(torch.cat([self.gb(gv), self.lb(lv), sf], 1))
+            return self.head(torch.cat([self.global_branch(gv), self.local_branch(lv), sf], 1))
 
     cnn = None
     if CNN_PATH.exists():

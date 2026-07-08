@@ -93,13 +93,13 @@ The API starts on `http://localhost:8000`. You should see output confirming both
 #### B. Start the MCMC Worker:
 Open a new terminal tab and run:
 ```bash
-./env/bin/celery -A tasks worker --loglevel=info --concurrency=2
+celery -A tasks worker --loglevel=info --concurrency=2
 ```
 
 #### C. Start the Batch Sector Worker:
 Open a new terminal tab and run:
 ```bash
-./env/bin/celery -A batch_pipeline worker --loglevel=info --concurrency=2
+celery -A batch_pipeline worker --loglevel=info --concurrency=2
 ```
 
 ### 5. Set Up the React Frontend

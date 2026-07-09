@@ -151,7 +151,7 @@ The frontend dashboard will be available at `http://localhost:5173`.
 | Layer     | Technology                                              |
 |-----------|---------------------------------------------------------|
 | Frontend  | React 19, Vite 8, HTML Canvas API                      |
-| Backend   | Flask, Flask-CORS, Celery, Redis                        |
+| Backend   | Flask, Celery, Redis                        |
 | Deep Learning | PyTorch, TransitFormer, 1D CNN                      |
 | Astrophysics | lightkurve, Astropy, emcee, batman                   |
 | Reporting | ReportLab, Matplotlib                                   |

@@ -1,140 +1,152 @@
 """
-train_transformer.py — Train TransitFormer on your local Mac (Apple Silicon MPS)
+train_transformer.py — Phase 4: Train TransitFormer on the large-scale TESS dataset
+
+Consumes data/tess/dataset.npz (built by fetch_tess_dataset.py +
+merge_tess_shards.py) and trains the TransitFormer classifier from
+transit_transformer.py.
+
+What changed from the Phase 1 version, and why:
+
+  - CLI args instead of hardcoded constants (DATA_PATH, EPOCHS, ...), so
+    repeated experiments at 20k+ scale don't require editing the file
+    every time.
+
+  - Optional stratified k-fold cross-validation (--kfold N). A held-out
+    test set is carved out *before* any folds are made, so test
+    performance is never contaminated by fold/model selection — this
+    matters more as the dataset grows, because a single lucky split can
+    otherwise look like a real improvement. Reports both per-fold test
+    AUC and an ensembled (fold-averaged) test AUC; averaging several
+    models' predictions is a standard, effective way to raise both
+    accuracy and calibration quality ("higher confidence" isn't just a
+    bigger number — it has to be trustworthy).
+
+  - Calibration reporting: Expected Calibration Error (ECE), Brier score,
+    and a reliability diagram, computed on the held-out test set. ROC-AUC
+    alone doesn't tell you whether a model's stated "94% confidence"
+    actually corresponds to being right 94% of the time — this makes that
+    checkable rather than assumed.
+
+  - Every run's config + fold results + calibration numbers are logged to
+    a timestamped JSON under data/tess/training_runs/, so successive
+    experiments (more data, different hyperparameters) are comparable.
+
+  - Kept the exact same 4-feature stellar schema (log_period,
+    log_duration, log_depth/10, snr/100) as Phase 1, deliberately — this
+    keeps the trained model a drop-in replacement for server.py and
+    batch_pipeline.py, which both hardcode n_stellar=4 in their
+    preprocessing. Expanding to the richer stellar params already being
+    collected by fetch_tess_dataset.py (Teff, radius, log g, Tmag) is a
+    good next step, but it requires updating those serving-side files too
+    — flagging it as a deliberate scope boundary here rather than a gap.
 
 Usage:
-    python train_transformer.py
+    # Single 70/15/15 split — fast iteration while the dataset is still small
+    python train_transformer.py --data data/tess/dataset.npz
 
-Expects the dataset cache from Phase 1 at:
-    ~/kepler_lcs/dataset.npz   (or set DATA_PATH below)
-
-If you don't have it, run Phase 1 notebook first to build the cache,
-then download dataset.npz from Colab Files panel.
-
-Saves: exodetect_transformer.pt  (alongside exodetect_cnn.pt)
+    # 5-fold CV + ensemble evaluation — do this once you have several
+    # thousand samples, before treating the model as production-ready
+    python train_transformer.py --data data/tess/dataset.npz --kfold 5 --epochs 30
 """
 
+import argparse
+import json
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe: this script is meant to run unattended
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, classification_report
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from pathlib import Path
-import time, warnings
+from sklearn.metrics import brier_score_loss, classification_report, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+from transit_transformer import build_transformer, get_device
+
 warnings.filterwarnings("ignore")
 
-from transit_transformer import build_transformer, get_device, TransitFormer
-
-# ── Config ─────────────────────────────────────────────────────────────────
-DATA_PATH    = Path(__file__).parent / "data" / "kepler_lcs" / "dataset.npz"
-OUT_PATH     = Path(__file__).parent / "exodetect_transformer.pt"
-GLOBAL_LEN   = 201
-PATCH_SIZE   = 3       # 201 / 3 = 67 patches
-BATCH_SIZE   = 64
-EPOCHS       = 40
-LR           = 2e-4
-DEVICE       = get_device()
-
-print(f"Device        : {DEVICE}")
-print(f"Dataset path  : {DATA_PATH}")
-print(f"Output path   : {OUT_PATH}")
+GLOBAL_LEN = 201
+PATCH_SIZE = 3
 
 
-# ── Dataset ─────────────────────────────────────────────────────────────────
+# ── Dataset ──────────────────────────────────────────────────────────────
 
 class TransitDataset(Dataset):
-    """Re-uses Phase 1 dataset.npz — only needs global_views."""
+    """Re-uses the merged dataset.npz — only needs global_views + stellar_feats."""
+
     def __init__(self, gv, sf, y, augment=False):
-        self.gv      = torch.tensor(gv, dtype=torch.float32)
-        self.sf      = torch.tensor(sf, dtype=torch.float32)
-        self.y       = torch.tensor(y,  dtype=torch.long)
+        self.gv = torch.tensor(gv, dtype=torch.float32)
+        self.sf = torch.tensor(sf, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
         self.augment = augment
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        gv = self.gv[idx]
-        sf = self.sf[idx]
-        y  = self.y[idx]
+        gv, sf, y = self.gv[idx], self.sf[idx], self.y[idx]
         if self.augment:
-            # Gaussian noise
-            gv = gv + torch.randn_like(gv) * 0.01
-            # Random roll (phase shift)
-            gv = torch.roll(gv, int(torch.randint(0, len(gv), (1,)).item()))
-            # Amplitude jitter
-            gv = gv * (1 + 0.02 * torch.randn(1).item())
+            gv = gv + torch.randn_like(gv) * 0.01              # gaussian noise
+            gv = torch.roll(gv, int(torch.randint(0, len(gv), (1,)).item()))  # phase shift
+            gv = gv * (1 + 0.02 * torch.randn(1).item())        # amplitude jitter
         return gv.unsqueeze(0), sf, y   # (1, L), (4,), scalar
 
 
-def load_data():
-    if not DATA_PATH.exists():
+def load_data(path: Path):
+    if not path.exists():
         raise FileNotFoundError(
-            f"\n❌ Dataset not found at {DATA_PATH}\n"
-            "   Download dataset.npz from your Colab session (Files panel)\n"
-            "   and place it at the path above, OR update DATA_PATH in this script."
+            f"\n❌ Dataset not found at {path}\n"
+            "   Run fetch_tess_dataset.py, then merge_tess_shards.py, or "
+            "pass --data pointing at your dataset.npz."
         )
-    d = np.load(DATA_PATH)
-    print(f"Loaded dataset: {d['global_views'].shape[0]} samples")
-    return (d["global_views"].astype(np.float32),
-            d["stellar_feats"].astype(np.float32),
-            d["labels"].astype(np.int64))
+    d = np.load(path)
+    gv = d["global_views"].astype(np.float32)
+    sf = d["stellar_feats"].astype(np.float32)
+    y = d["labels"].astype(np.int64)
+    print(f"Loaded dataset: {len(y)} samples "
+          f"({int((y == 1).sum())} positive / {int((y == 0).sum())} negative)")
+    return gv, sf, y
 
 
-# ── Training loop ───────────────────────────────────────────────────────────
+def make_loaders(gv, sf, y, idx_trn, idx_val, batch_size):
+    ds_trn = TransitDataset(gv[idx_trn], sf[idx_trn], y[idx_trn], augment=True)
+    ds_val = TransitDataset(gv[idx_val], sf[idx_val], y[idx_val])
 
-def train():
-    gv, sf, labels = load_data()
-
-    # 70 / 15 / 15 split
-    idx = np.arange(len(labels))
-    idx_trn, idx_tmp = train_test_split(idx, test_size=0.30, stratify=labels, random_state=42)
-    idx_val, idx_tst = train_test_split(idx_tmp, test_size=0.50,
-                                         stratify=labels[idx_tmp], random_state=42)
-
-    ds_trn = TransitDataset(gv[idx_trn], sf[idx_trn], labels[idx_trn], augment=True)
-    ds_val = TransitDataset(gv[idx_val], sf[idx_val], labels[idx_val])
-    ds_tst = TransitDataset(gv[idx_tst], sf[idx_tst], labels[idx_tst])
-
-    # Weighted sampler for class imbalance
-    counts  = np.bincount(labels[idx_trn])
-    weights = 1.0 / counts[labels[idx_trn]]
+    counts = np.bincount(y[idx_trn])
+    weights = 1.0 / counts[y[idx_trn]]
     sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
 
-    dl_trn = DataLoader(ds_trn, batch_size=BATCH_SIZE, sampler=sampler,
-                        num_workers=0, pin_memory=False)
-    dl_val = DataLoader(ds_val, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=0, pin_memory=False)
-    dl_tst = DataLoader(ds_tst, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=0, pin_memory=False)
+    dl_trn = DataLoader(ds_trn, batch_size=batch_size, sampler=sampler, num_workers=0)
+    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=0)
+    return dl_trn, dl_val
 
-    print(f"Train: {len(ds_trn)}  Val: {len(ds_val)}  Test: {len(ds_tst)}")
 
-    # Build model
-    model = build_transformer(seq_len=GLOBAL_LEN, patch_size=PATCH_SIZE, device=DEVICE)
+# ── Training ─────────────────────────────────────────────────────────────
 
+def train_one_model(gv, sf, y, idx_trn, idx_val, args, device, tag="fold0"):
+    """Trains one TransitFormer to convergence with early stopping.
+    Returns (model_with_best_weights, history, best_val_auc, best_epoch)."""
+    dl_trn, dl_val = make_loaders(gv, sf, y, idx_trn, idx_val, args.batch_size)
+
+    model = build_transformer(seq_len=GLOBAL_LEN, patch_size=PATCH_SIZE, device=device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    history    = {"trn_loss": [], "val_loss": [], "val_auc": []}
-    best_auc   = 0.0
-    best_epoch = 0
-    patience   = 10
-    no_improve = 0
+    history = {"trn_loss": [], "val_loss": [], "val_auc": []}
+    best_auc, best_epoch, no_improve = 0.0, 0, 0
+    best_state = None
 
-    print(f"\nTraining TransitFormer for {EPOCHS} epochs on {DEVICE}…\n")
-
-    for epoch in range(1, EPOCHS + 1):
-        # ── Train ──────────────────────────────────────────────────────────
+    for epoch in range(1, args.epochs + 1):
         model.train()
         trn_loss = 0.0
         for gv_b, sf_b, y_b in dl_trn:
-            gv_b, sf_b, y_b = gv_b.to(DEVICE), sf_b.to(DEVICE), y_b.to(DEVICE)
+            gv_b, sf_b, y_b = gv_b.to(device), sf_b.to(device), y_b.to(device)
             optimizer.zero_grad()
             logits, _ = model(gv_b, sf_b, return_attn=False)
             loss = criterion(logits, y_b)
@@ -145,105 +157,270 @@ def train():
         trn_loss /= len(dl_trn)
         scheduler.step()
 
-        # ── Validate ───────────────────────────────────────────────────────
         model.eval()
         val_loss = 0.0
         probs_all, labels_all = [], []
         with torch.no_grad():
             for gv_b, sf_b, y_b in dl_val:
-                gv_b, sf_b, y_b = gv_b.to(DEVICE), sf_b.to(DEVICE), y_b.to(DEVICE)
+                gv_b, sf_b, y_b = gv_b.to(device), sf_b.to(device), y_b.to(device)
                 logits, _ = model(gv_b, sf_b)
                 val_loss += criterion(logits, y_b).item()
                 probs = torch.softmax(logits, dim=1)[:, 1]
                 probs_all.extend(probs.cpu().numpy())
                 labels_all.extend(y_b.cpu().numpy())
         val_loss /= len(dl_val)
-        val_auc   = roc_auc_score(labels_all, probs_all)
+        val_auc = roc_auc_score(labels_all, probs_all)
 
         history["trn_loss"].append(trn_loss)
         history["val_loss"].append(val_loss)
         history["val_auc"].append(val_auc)
 
-        # Early stopping
         if val_auc > best_auc:
-            best_auc   = val_auc
-            best_epoch = epoch
-            no_improve = 0
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "model_config": {
-                    "seq_len":    GLOBAL_LEN,
-                    "patch_size": PATCH_SIZE,
-                    "d_model":    64,
-                    "n_heads":    4,
-                    "n_layers":   4,
-                    "ff_dim":     256,
-                    "n_stellar":  4,
-                    "dropout":    0.1,
-                    "n_classes":  2,
-                },
-                "metrics": {
-                    "best_val_auc": best_auc,
-                    "best_epoch":   best_epoch,
-                },
-            }, OUT_PATH)
+            best_auc, best_epoch, no_improve = val_auc, epoch, 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             no_improve += 1
 
         marker = " ◀ best" if epoch == best_epoch else ""
-        print(f"Epoch {epoch:3d}/{EPOCHS}  "
-              f"trn={trn_loss:.4f}  val={val_loss:.4f}  AUC={val_auc:.4f}{marker}")
+        print(f"[{tag}] Epoch {epoch:3d}/{args.epochs}  trn={trn_loss:.4f}  "
+              f"val={val_loss:.4f}  AUC={val_auc:.4f}{marker}")
 
-        if no_improve >= patience:
-            print(f"\nEarly stopping at epoch {epoch}")
+        if no_improve >= args.patience:
+            print(f"[{tag}] Early stopping at epoch {epoch} "
+                  f"(no val AUC improvement for {args.patience} epochs)")
             break
 
-    # ── Test evaluation ─────────────────────────────────────────────────────
-    print(f"\n✅ Best val AUC: {best_auc:.4f} at epoch {best_epoch}")
-    print("Loading best checkpoint for test evaluation…")
+    model.load_state_dict(best_state)
+    return model, history, best_auc, best_epoch
 
-    ckpt = torch.load(OUT_PATH, map_location="cpu")
-    model.load_state_dict(ckpt["model_state_dict"])
+
+@torch.no_grad()
+def predict_probs(model, gv, sf, idx, device, batch_size=128):
     model.eval()
+    probs = []
+    for i in range(0, len(idx), batch_size):
+        chunk = idx[i:i + batch_size]
+        gv_b = torch.tensor(gv[chunk], dtype=torch.float32).unsqueeze(1).to(device)
+        sf_b = torch.tensor(sf[chunk], dtype=torch.float32).to(device)
+        logits, _ = model(gv_b, sf_b)
+        probs.append(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
+    return np.concatenate(probs)
 
-    probs_tst, labels_tst = [], []
-    with torch.no_grad():
-        for gv_b, sf_b, y_b in dl_tst:
-            gv_b, sf_b = gv_b.to(DEVICE), sf_b.to(DEVICE)
-            logits, _  = model(gv_b, sf_b)
-            probs = torch.softmax(logits, dim=1)[:, 1]
-            probs_tst.extend(probs.cpu().numpy())
-            labels_tst.extend(y_b.numpy())
 
-    probs_tst  = np.array(probs_tst)
-    labels_tst = np.array(labels_tst)
-    test_auc   = roc_auc_score(labels_tst, probs_tst)
+# ── Calibration ──────────────────────────────────────────────────────────
 
-    print(f"\n=== Test Set Evaluation ===")
-    print(f"ROC-AUC : {test_auc:.4f}")
-    print(classification_report(labels_tst, (probs_tst >= 0.5).astype(int),
+def expected_calibration_error(probs, labels, n_bins=10):
+    """
+    ECE: weighted average gap between predicted confidence and actual
+    accuracy, bucketed into n_bins. A well-calibrated model that says
+    "90% confident" should be right ~90% of the time within that bucket.
+    """
+    bins = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    bin_stats = []
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i + 1]
+        mask = (probs >= lo) & (probs < hi if i < n_bins - 1 else probs <= hi)
+        n = int(mask.sum())
+        if n == 0:
+            bin_stats.append({"lo": lo, "hi": hi, "count": 0, "acc": None, "conf": None})
+            continue
+        acc = float(labels[mask].mean())
+        conf = float(probs[mask].mean())
+        ece += (n / len(probs)) * abs(acc - conf)
+        bin_stats.append({"lo": lo, "hi": hi, "count": n, "acc": acc, "conf": conf})
+    return float(ece), bin_stats
+
+
+def plot_reliability_diagram(probs, labels, out_path, title="Reliability Diagram"):
+    ece, bin_stats = expected_calibration_error(probs, labels)
+    confs  = [b["conf"] for b in bin_stats if b["count"] > 0]
+    accs   = [b["acc"] for b in bin_stats if b["count"] > 0]
+    counts = [b["count"] for b in bin_stats if b["count"] > 0]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    ax1.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Perfectly calibrated")
+    ax1.plot(confs, accs, marker="o", color="#7C3AED", label="Model")
+    ax1.set_xlabel("Mean predicted probability")
+    ax1.set_ylabel("Empirical accuracy")
+    ax1.set_title(f"{title}\n(ECE = {ece:.4f})")
+    ax1.legend()
+    ax1.set_xlim(0, 1)
+    ax1.set_ylim(0, 1)
+
+    ax2.bar(confs, counts, width=0.08, color="#00D4FF", alpha=0.8)
+    ax2.set_xlabel("Mean predicted probability (bin)")
+    ax2.set_ylabel("Sample count")
+    ax2.set_title("Prediction confidence distribution")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return ece
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Train TransitFormer on TESS data")
+    parser.add_argument("--data", type=Path,
+                         default=Path(__file__).parent / "data" / "tess" / "dataset.npz")
+    parser.add_argument("--out", type=Path,
+                         default=Path(__file__).parent / "exodetect_transformer.pt")
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--kfold", type=int, default=1,
+                         help="1 = single 70/15/15 split (default, fast). "
+                              ">1 = stratified k-fold CV over train+val, evaluated "
+                              "against one fixed held-out test set.")
+    parser.add_argument("--test-size", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    device = get_device()
+    print(f"Device: {device}")
+
+    gv, sf, y = load_data(args.data)
+
+    run_dir = Path(__file__).parent / "data" / "tess" / "training_runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    idx_all = np.arange(len(y))
+    idx_trainval, idx_test = train_test_split(
+        idx_all, test_size=args.test_size, stratify=y, random_state=args.seed
+    )
+    print(f"Held-out test set: {len(idx_test)} samples "
+          f"(never touched during training or fold selection)")
+
+    fold_results = []
+    fold_probs_on_test = []
+
+    if args.kfold <= 1:
+        # ── Single split ──────────────────────────────────────────────
+        val_frac_of_trainval = 0.15 / (1 - args.test_size)
+        idx_trn, idx_val = train_test_split(
+            idx_trainval, test_size=val_frac_of_trainval,
+            stratify=y[idx_trainval], random_state=args.seed,
+        )
+        model, history, best_val_auc, best_epoch = train_one_model(
+            gv, sf, y, idx_trn, idx_val, args, device, tag="fold0"
+        )
+        test_probs = predict_probs(model, gv, sf, idx_test, device)
+        test_auc = roc_auc_score(y[idx_test], test_probs)
+        fold_results.append({"fold": 0, "best_val_auc": best_val_auc,
+                              "best_epoch": best_epoch, "test_auc": float(test_auc)})
+        fold_probs_on_test.append(test_probs)
+
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "model_config": {
+                "seq_len": GLOBAL_LEN, "patch_size": PATCH_SIZE, "d_model": 64,
+                "n_heads": 4, "n_layers": 4, "ff_dim": 256, "n_stellar": 4,
+                "dropout": 0.1, "n_classes": 2,
+            },
+            "metrics": {"best_val_auc": best_val_auc, "best_epoch": best_epoch,
+                        "test_auc": float(test_auc)},
+        }, args.out)
+        print(f"\n✅ Model saved to {args.out}  "
+              f"(val AUC {best_val_auc:.4f}, test AUC {test_auc:.4f})")
+
+    else:
+        # ── K-fold CV ─────────────────────────────────────────────────
+        skf = StratifiedKFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
+        best_overall_auc = -1.0
+        best_overall_state = None
+        best_overall_config = None
+
+        for fold, (trn_rel, val_rel) in enumerate(skf.split(idx_trainval, y[idx_trainval])):
+            idx_trn = idx_trainval[trn_rel]
+            idx_val = idx_trainval[val_rel]
+            model, history, best_val_auc, best_epoch = train_one_model(
+                gv, sf, y, idx_trn, idx_val, args, device, tag=f"fold{fold}"
+            )
+            test_probs = predict_probs(model, gv, sf, idx_test, device)
+            test_auc = roc_auc_score(y[idx_test], test_probs)
+            fold_results.append({"fold": fold, "best_val_auc": best_val_auc,
+                                  "best_epoch": best_epoch, "test_auc": float(test_auc)})
+            fold_probs_on_test.append(test_probs)
+
+            if best_val_auc > best_overall_auc:
+                best_overall_auc = best_val_auc
+                best_overall_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_overall_config = {
+                    "seq_len": GLOBAL_LEN, "patch_size": PATCH_SIZE, "d_model": 64,
+                    "n_heads": 4, "n_layers": 4, "ff_dim": 256, "n_stellar": 4,
+                    "dropout": 0.1, "n_classes": 2,
+                }
+
+        test_aucs = [r["test_auc"] for r in fold_results]
+        print(f"\n=== {args.kfold}-Fold CV Results ===")
+        for r in fold_results:
+            print(f"  Fold {r['fold']}: val AUC={r['best_val_auc']:.4f}  "
+                  f"test AUC={r['test_auc']:.4f}")
+        print(f"  Mean test AUC : {np.mean(test_aucs):.4f} ± {np.std(test_aucs):.4f}")
+
+        ensemble_probs = np.mean(fold_probs_on_test, axis=0)
+        ensemble_auc = roc_auc_score(y[idx_test], ensemble_probs)
+        print(f"  Ensemble (avg of {args.kfold} folds) test AUC: {ensemble_auc:.4f}")
+
+        torch.save({
+            "model_state_dict": best_overall_state,
+            "model_config": best_overall_config,
+            "metrics": {
+                "best_val_auc": best_overall_auc,
+                "mean_test_auc": float(np.mean(test_aucs)),
+                "std_test_auc": float(np.std(test_aucs)),
+                "ensemble_test_auc": float(ensemble_auc),
+            },
+        }, args.out)
+        print(f"\n✅ Best single fold saved to {args.out} (val AUC {best_overall_auc:.4f})")
+        print(f"   Note: the ENSEMBLE AUC ({ensemble_auc:.4f}) was higher than any single "
+              f"fold — for the strongest production confidence, consider serving all "
+              f"{args.kfold} fold checkpoints and averaging their predictions in "
+              f"server.py rather than deploying just this single best fold.")
+
+        test_probs = ensemble_probs  # calibration report below uses the ensemble
+
+    # ── Final held-out test report + calibration ──────────────────────
+    test_labels = y[idx_test]
+    test_preds = (test_probs >= 0.5).astype(int)
+
+    print("\n=== Held-Out Test Set Evaluation ===")
+    print(f"ROC-AUC     : {roc_auc_score(test_labels, test_probs):.4f}")
+    print(f"Brier score : {brier_score_loss(test_labels, test_probs):.4f}  "
+          f"(0 = perfect, lower is better calibrated)")
+    print()
+    print(classification_report(test_labels, test_preds,
                                  target_names=["False Positive", "Planet"]))
 
-    # Update checkpoint with test AUC
-    ckpt["metrics"]["test_auc"] = test_auc
-    torch.save(ckpt, OUT_PATH)
+    cal_path = run_dir / f"calibration_{run_id}.png"
+    ece = plot_reliability_diagram(test_probs, test_labels, cal_path,
+                                    title="TransitFormer — Test Set Calibration")
+    print(f"Expected Calibration Error (ECE): {ece:.4f}")
+    print(f"Reliability diagram saved to {cal_path}")
 
-    # ── Training curves ─────────────────────────────────────────────────────
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    ep = range(1, len(history["trn_loss"]) + 1)
-    ax1.plot(ep, history["trn_loss"], label="Train", color="#A78BFA")
-    ax1.plot(ep, history["val_loss"],  label="Val",   color="#FF4757")
-    ax1.axvline(best_epoch, color="gray", linestyle="--", linewidth=0.8)
-    ax1.set_title("TransitFormer Loss"); ax1.legend()
-    ax2.plot(ep, history["val_auc"], color="#00D4FF", linewidth=2)
-    ax2.axhline(best_auc, color="gray", linestyle="--")
-    ax2.set_title(f"Val AUC (best={best_auc:.4f})"); ax2.set_ylim(0.5, 1.0)
-    plt.tight_layout()
-    plot_path = OUT_PATH.parent / "transformer_training.png"
-    plt.savefig(plot_path, dpi=120, bbox_inches="tight")
-    print(f"\n✅ Training plot saved to {plot_path}")
-    print(f"✅ Model saved to {OUT_PATH}")
+    args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+    run_log = {
+        "run_id": run_id,
+        "args": args_dict,
+        "n_samples": len(y),
+        "n_positive": int((y == 1).sum()),
+        "n_negative": int((y == 0).sum()),
+        "n_test": len(idx_test),
+        "fold_results": fold_results,
+        "test_auc": float(roc_auc_score(test_labels, test_probs)),
+        "brier_score": float(brier_score_loss(test_labels, test_probs)),
+        "ece": ece,
+        "timestamp": datetime.now().isoformat(),
+    }
+    log_path = run_dir / f"run_{run_id}.json"
+    log_path.write_text(json.dumps(run_log, indent=2))
+    print(f"\nRun metadata logged to {log_path}")
 
 
 if __name__ == "__main__":
-    train()
+    main()

@@ -531,14 +531,14 @@ def print_dataset_summary(manifest: pd.DataFrame):
     n_pos = (done["label"] == 1).sum()
     n_neg = (done["label"] == 0).sum()
     n_shards = len(list(SHARD_DIR.glob("shard_*.npz")))
-    print("\n" + "=" * 60)
-    print("DATASET SUMMARY")
-    print("=" * 60)
-    print(f"  Done      : {len(done)}  ({n_pos} positive / {n_neg} negative)")
-    print(f"  Failed    : {(manifest['status'] == 'no_data').sum()}")
-    print(f"  Pending   : {(manifest['status'] == 'pending').sum()}")
-    print(f"  Shards    : {n_shards}  in {SHARD_DIR}")
-    print("=" * 60)
+    log.info("\n" + "=" * 60)
+    log.info("DATASET SUMMARY")
+    log.info("=" * 60)
+    log.info(f"  Done      : {len(done)}  ({n_pos} positive / {n_neg} negative)")
+    log.info(f"  Failed    : {(manifest['status'] == 'no_data').sum()}")
+    log.info(f"  Pending   : {(manifest['status'] == 'pending').sum()}")
+    log.info(f"  Shards    : {n_shards}  in {SHARD_DIR}")
+    log.info("=" * 60)
 
 
 def main():

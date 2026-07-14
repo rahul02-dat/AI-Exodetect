@@ -14,6 +14,7 @@ An end-to-end web application that fetches **real TESS satellite data** from NAS
 - **Full TESS Sector Batch Processing** — Automatically downloads target lists from MAST for a given sector, scans them concurrently using the ensemble, and logs candidates.
 - **PDF Report Generation** — Dynamically generates professional PDF analysis reports (with phase-folded light curves, BLS power, and MCMC parameter statistics) for individual candidates or full-sector batches.
 - **Live Backend Status & Device Detection** — Real-time backend connectivity check and automatic device mapping (MPS for Apple Silicon, CUDA for Nvidia, CPU fallback).
+- **Modular Stellar Feature Engineering** — Supports model-specific schema versioning and real-time TIC (TESS Input Catalog) parameter lookups.
 
 ---
 
@@ -28,6 +29,9 @@ Exodetect/
 ├── train_transformer.py      # TransitFormer training script with early stopping & AUC logging
 ├── report_generator.py       # PDF generator using ReportLab and Matplotlib
 ├── mcmc_fitter.py            # MCMC transit modeling using emcee and batman
+├── stellar_features.py       # Modular stellar feature engineering & TIC lookups
+├── fetch_TESS_Dataset.py     # Script to fetch and process TESS datasets
+├── merge_tess_shards.py      # Utility to merge TESS data shards
 ├── exodetect_cnn.pt          # Exported PyTorch CNN weights
 ├── exodetect_transformer.pt  # Exported PyTorch TransitFormer weights
 ├── data/

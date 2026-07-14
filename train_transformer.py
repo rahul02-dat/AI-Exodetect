@@ -31,14 +31,15 @@ What changed from the Phase 1 version, and why:
     a timestamped JSON under data/tess/training_runs/, so successive
     experiments (more data, different hyperparameters) are comparable.
 
-  - Kept the exact same 4-feature stellar schema (log_period,
-    log_duration, log_depth/10, snr/100) as Phase 1, deliberately — this
-    keeps the trained model a drop-in replacement for server.py and
-    batch_pipeline.py, which both hardcode n_stellar=4 in their
-    preprocessing. Expanding to the richer stellar params already being
-    collected by fetch_tess_dataset.py (Teff, radius, log g, Tmag) is a
-    good next step, but it requires updating those serving-side files too
-    — flagging it as a deliberate scope boundary here rather than a gap.
+  - n_stellar is now auto-detected from the dataset (sf.shape[1]) rather
+    than hardcoded to 4. merge_tess_shards.py can produce either the
+    legacy 4-feature vector or the expanded 8-feature vector (adds
+    normalized Teff/radius/log g/Tmag) — whichever it wrote, this script
+    picks up automatically and saves it into the checkpoint's
+    model_config, which is what server.py / batch_pipeline.py read to
+    build matching stellar tensors at inference time (see
+    stellar_features.py). A CNN and TransitFormer on different schema
+    versions can still be ensembled together during a gradual rollout.
 
 Usage:
     # Single 70/15/15 split — fast iteration while the dataset is still small
@@ -108,8 +109,12 @@ def load_data(path: Path):
     gv = d["global_views"].astype(np.float32)
     sf = d["stellar_feats"].astype(np.float32)
     y = d["labels"].astype(np.int64)
+    n_stellar = sf.shape[1]
+    schema = "legacy (transit-only)" if n_stellar == 4 else \
+             "expanded (+ Teff/radius/log g/Tmag)" if n_stellar == 8 else "custom"
     print(f"Loaded dataset: {len(y)} samples "
           f"({int((y == 1).sum())} positive / {int((y == 0).sum())} negative)")
+    print(f"Stellar feature dimensionality: {n_stellar}  [{schema}]")
     return gv, sf, y
 
 
@@ -128,12 +133,13 @@ def make_loaders(gv, sf, y, idx_trn, idx_val, batch_size):
 
 # ── Training ─────────────────────────────────────────────────────────────
 
-def train_one_model(gv, sf, y, idx_trn, idx_val, args, device, tag="fold0"):
+def train_one_model(gv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag="fold0"):
     """Trains one TransitFormer to convergence with early stopping.
     Returns (model_with_best_weights, history, best_val_auc, best_epoch)."""
     dl_trn, dl_val = make_loaders(gv, sf, y, idx_trn, idx_val, args.batch_size)
 
-    model = build_transformer(seq_len=GLOBAL_LEN, patch_size=PATCH_SIZE, device=device)
+    model = build_transformer(seq_len=GLOBAL_LEN, patch_size=PATCH_SIZE,
+                               n_stellar=n_stellar, device=device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -284,6 +290,7 @@ def main():
     print(f"Device: {device}")
 
     gv, sf, y = load_data(args.data)
+    n_stellar = sf.shape[1]
 
     run_dir = Path(__file__).parent / "data" / "tess" / "training_runs"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -307,7 +314,7 @@ def main():
             stratify=y[idx_trainval], random_state=args.seed,
         )
         model, history, best_val_auc, best_epoch = train_one_model(
-            gv, sf, y, idx_trn, idx_val, args, device, tag="fold0"
+            gv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag="fold0"
         )
         test_probs = predict_probs(model, gv, sf, idx_test, device)
         test_auc = roc_auc_score(y[idx_test], test_probs)
@@ -319,7 +326,7 @@ def main():
             "model_state_dict": model.state_dict(),
             "model_config": {
                 "seq_len": GLOBAL_LEN, "patch_size": PATCH_SIZE, "d_model": 64,
-                "n_heads": 4, "n_layers": 4, "ff_dim": 256, "n_stellar": 4,
+                "n_heads": 4, "n_layers": 4, "ff_dim": 256, "n_stellar": n_stellar,
                 "dropout": 0.1, "n_classes": 2,
             },
             "metrics": {"best_val_auc": best_val_auc, "best_epoch": best_epoch,
@@ -339,7 +346,7 @@ def main():
             idx_trn = idx_trainval[trn_rel]
             idx_val = idx_trainval[val_rel]
             model, history, best_val_auc, best_epoch = train_one_model(
-                gv, sf, y, idx_trn, idx_val, args, device, tag=f"fold{fold}"
+                gv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag=f"fold{fold}"
             )
             test_probs = predict_probs(model, gv, sf, idx_test, device)
             test_auc = roc_auc_score(y[idx_test], test_probs)
@@ -352,7 +359,7 @@ def main():
                 best_overall_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 best_overall_config = {
                     "seq_len": GLOBAL_LEN, "patch_size": PATCH_SIZE, "d_model": 64,
-                    "n_heads": 4, "n_layers": 4, "ff_dim": 256, "n_stellar": 4,
+                    "n_heads": 4, "n_layers": 4, "ff_dim": 256, "n_stellar": n_stellar,
                     "dropout": 0.1, "n_classes": 2,
                 }
 

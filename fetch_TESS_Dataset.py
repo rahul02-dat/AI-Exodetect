@@ -430,6 +430,16 @@ def process_target(spec: TargetSpec, max_sectors: int = 6) -> Optional[dict]:
         if not (period and period > 0):
             return None
 
+        st_teff, st_rad, st_logg, st_tmag = spec.st_teff, spec.st_rad, spec.st_logg, spec.st_tmag
+        if st_teff is None and st_rad is None and st_logg is None and st_tmag is None:
+            # No TOI catalog entry for this target (typically a random-field
+            # negative) — fall back to a live TIC lookup, same helper the
+            # serving backend uses, so training and inference source
+            # stellar params identically.
+            from stellar_features import fetch_stellar_params
+            live = fetch_stellar_params(spec.tic_id)
+            st_teff, st_rad, st_logg, st_tmag = live["teff"], live["rad"], live["logg"], live["tmag"]
+
         smoothed = median_smooth(flux_arr)
         gv = phase_fold_and_bin(time_arr, smoothed, period, t0, GLOBAL_VIEW_LEN, local=False)
         lv = phase_fold_and_bin(time_arr, smoothed, period, t0, LOCAL_VIEW_LEN, local=True)
@@ -457,10 +467,10 @@ def process_target(spec: TargetSpec, max_sectors: int = 6) -> Optional[dict]:
             "period": period,
             "n_sectors": len(lcs),
             "n_cadences": len(time_arr),
-            "st_teff": spec.st_teff if spec.st_teff is not None else np.nan,
-            "st_rad": spec.st_rad if spec.st_rad is not None else np.nan,
-            "st_logg": spec.st_logg if spec.st_logg is not None else np.nan,
-            "st_tmag": spec.st_tmag if spec.st_tmag is not None else np.nan,
+            "st_teff": st_teff if st_teff is not None else np.nan,
+            "st_rad": st_rad if st_rad is not None else np.nan,
+            "st_logg": st_logg if st_logg is not None else np.nan,
+            "st_tmag": st_tmag if st_tmag is not None else np.nan,
             "disposition": spec.disposition,
         }
     except Exception as e:
@@ -531,14 +541,14 @@ def print_dataset_summary(manifest: pd.DataFrame):
     n_pos = (done["label"] == 1).sum()
     n_neg = (done["label"] == 0).sum()
     n_shards = len(list(SHARD_DIR.glob("shard_*.npz")))
-    log.info("\n" + "=" * 60)
-    log.info("DATASET SUMMARY")
-    log.info("=" * 60)
-    log.info(f"  Done      : {len(done)}  ({n_pos} positive / {n_neg} negative)")
-    log.info(f"  Failed    : {(manifest['status'] == 'no_data').sum()}")
-    log.info(f"  Pending   : {(manifest['status'] == 'pending').sum()}")
-    log.info(f"  Shards    : {n_shards}  in {SHARD_DIR}")
-    log.info("=" * 60)
+    print("\n" + "=" * 60)
+    print("DATASET SUMMARY")
+    print("=" * 60)
+    print(f"  Done      : {len(done)}  ({n_pos} positive / {n_neg} negative)")
+    print(f"  Failed    : {(manifest['status'] == 'no_data').sum()}")
+    print(f"  Pending   : {(manifest['status'] == 'pending').sum()}")
+    print(f"  Shards    : {n_shards}  in {SHARD_DIR}")
+    print("=" * 60)
 
 
 def main():

@@ -10,6 +10,17 @@ New in Phase 3:
   GET  /api/report/sector    → download PDF for full sector
   GET  /api/model-info       → CNN + Transformer metadata
 
+Phase 4 update:
+  Stellar feature construction (period/duration/depth/SNR + optional
+  Teff/radius/log g/Tmag) now goes through the shared stellar_features
+  module instead of being hand-rolled here, and each model's tensor is
+  sized to that model's own n_stellar — see stellar_features.py and the
+  ExoEnsemble.predict() changes in transit_transformer.py for why. This
+  also adds a live TIC catalog lookup (fetch_stellar_params) so real
+  Teff/radius/log g/Tmag values are used when a model checkpoint expects
+  the expanded 8-feature schema, rather than falling back to imputed
+  defaults for every request.
+
 Drop this alongside server_phase2.py (or replace it).
 """
 
@@ -33,6 +44,9 @@ from transit_transformer import (
 )
 from batch_pipeline import celery_app as batch_celery, run_sector
 from report_generator import generate_candidate_report, generate_sector_report
+
+# Phase 4 import — shared stellar feature engineering (see module docstring)
+from stellar_features import build_stellar_features, fetch_stellar_params, extract_tic_id
 
 app   = Flask(__name__)
 CORS(app)
@@ -74,6 +88,8 @@ class SafeAdaptiveAvgPool1d(nn.Module):
 class ExoDetectCNN(nn.Module):
     def __init__(self, global_len=201, local_len=81, n_stellar=4):
         super().__init__()
+        self.n_stellar = n_stellar   # Phase 4: recorded so ExoEnsemble.predict()
+                                      # can size this model's stellar tensor correctly.
         self.global_branch = nn.Sequential(
             ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
             ConvBlock(32,64,5,2), ConvBlock(64,128,3,2),
@@ -98,13 +114,15 @@ def load_models():
         CNN_MODEL.load_state_dict(ckpt["model_state_dict"])
         CNN_MODEL.eval()
         CNN_META = ckpt.get("metrics", {})
-        print(f"[INFO] CNN loaded — Val AUC {CNN_META.get('best_val_auc','?')}")
+        print(f"[INFO] CNN loaded — Val AUC {CNN_META.get('best_val_auc','?')} "
+              f"(n_stellar={CNN_MODEL.n_stellar})")
     else:
         print(f"[WARN] No CNN model at {CNN_PATH}")
 
     if os.path.exists(TRANSFORMER_PATH):
         TF_MODEL, TF_META = load_transformer(TRANSFORMER_PATH, device=DEVICE)
-        print(f"[INFO] TransitFormer loaded — Val AUC {TF_META.get('best_val_auc','?')}")
+        print(f"[INFO] TransitFormer loaded — Val AUC {TF_META.get('best_val_auc','?')} "
+              f"(n_stellar={TF_MODEL.n_stellar})")
     else:
         print(f"[WARN] No TransitFormer at {TRANSFORMER_PATH}")
         print("       Run: python train_transformer.py")
@@ -112,6 +130,12 @@ def load_models():
     if CNN_MODEL and TF_MODEL:
         ENSEMBLE = ExoEnsemble(CNN_MODEL, TF_MODEL, device=DEVICE)
         print("[INFO] Ensemble ready (CNN + TransitFormer)")
+        if CNN_MODEL.n_stellar != TF_MODEL.n_stellar:
+            print(f"[INFO] Note: CNN (n_stellar={CNN_MODEL.n_stellar}) and TransitFormer "
+                  f"(n_stellar={TF_MODEL.n_stellar}) are on different stellar-feature "
+                  f"schema versions — this is fine, each is fed its own correctly-sized "
+                  f"feature vector, but consider retraining both to the same schema "
+                  f"once convenient.")
     elif CNN_MODEL:
         print("[INFO] Running CNN-only mode (no TransitFormer yet)")
 
@@ -144,16 +168,22 @@ def _fold_bin(time, flux, period, t0, n_bins, local=False, lw=0.2):
         view = (view - mu) / sig
     return view.astype(np.float32)
 
-def _tensors(gv, lv, period, dur_hr, depth_ppm, snr):
+def _view_tensors(gv, lv):
+    """Global/local view tensors — these don't depend on which model consumes
+    them, unlike the stellar feature tensor (see _stellar_tensor_for)."""
     gv_t = torch.tensor(gv).unsqueeze(0).unsqueeze(0).to(DEVICE)
     lv_t = torch.tensor(lv).unsqueeze(0).unsqueeze(0).to(DEVICE) if lv is not None else None
-    sf_t = torch.tensor([[
-        float(np.log1p(period)),
-        float(np.log1p(max(dur_hr, 0))),
-        float(np.log1p(max(depth_ppm, 0))) / 10,
-        float(np.clip(snr, 0, 100)) / 100,
-    ]]).to(DEVICE)
-    return gv_t, lv_t, sf_t
+    return gv_t, lv_t
+
+def _stellar_tensor_for(model, period, dur_hr, depth_ppm, snr, stellar_params):
+    """Builds a stellar feature tensor sized to whatever a specific model
+    checkpoint expects (model.n_stellar) — see stellar_features.py."""
+    sf = build_stellar_features(
+        model.n_stellar, period, dur_hr, depth_ppm, snr,
+        stellar_params.get("teff"), stellar_params.get("rad"),
+        stellar_params.get("logg"), stellar_params.get("tmag"),
+    )
+    return torch.tensor([sf]).to(DEVICE)
 
 def _heuristic(period, depth_pct, dur_hr, snr):
     if depth_pct > 5: return {"Exoplanet Transit": 8.0, "Eclipsing Binary": 81.0, "Stellar Blend": 7.0, "Starspot": 4.0}
@@ -161,15 +191,26 @@ def _heuristic(period, depth_pct, dur_hr, snr):
     return             {"Exoplanet Transit": 91.0,"Eclipsing Binary": 5.0,  "Stellar Blend": 3.0, "Starspot": 1.0}
 
 
-def classify_with_ensemble(gv, lv, period, dur_hr, depth_ppm, snr):
-    """Returns probs dict, p_cnn, p_tf, attn_weights."""
+def classify_with_ensemble(gv, lv, period, dur_hr, depth_ppm, snr, stellar_params=None):
+    """Returns probs dict, p_cnn, p_tf, attn_weights.
+
+    stellar_params: optional dict with teff/rad/logg/tmag (see
+    fetch_stellar_params in stellar_features.py). Safe to omit or leave
+    fields as None — build_stellar_features() imputes neutral defaults."""
+    stellar_params = stellar_params or {}
+
     if ENSEMBLE and gv is not None and lv is not None:
-        gv_t, lv_t, sf_t = _tensors(gv, lv, period, dur_hr, depth_ppm, snr)
-        p, p_cnn, p_tf, attn = ENSEMBLE.predict(gv_t, lv_t, sf_t)
+        gv_t, lv_t = _view_tensors(gv, lv)
+        p, p_cnn, p_tf, attn = ENSEMBLE.predict(
+            gv_t, lv_t, period, dur_hr, depth_ppm, snr,
+            teff=stellar_params.get("teff"), rad=stellar_params.get("rad"),
+            logg=stellar_params.get("logg"), tmag=stellar_params.get("tmag"),
+        )
         probs = ENSEMBLE.classify(p, depth_ppm, period, dur_hr)
         return probs, p_cnn, p_tf, attn.tolist() if attn is not None else None
     elif CNN_MODEL and gv is not None and lv is not None:
-        gv_t, lv_t, sf_t = _tensors(gv, lv, period, dur_hr, depth_ppm, snr)
+        gv_t, lv_t = _view_tensors(gv, lv)
+        sf_t = _stellar_tensor_for(CNN_MODEL, period, dur_hr, depth_ppm, snr, stellar_params)
         with torch.no_grad():
             logits = CNN_MODEL(gv_t, lv_t, sf_t)
             p_cnn  = float(torch.softmax(logits, dim=1)[:, 1].item())
@@ -203,6 +244,12 @@ def fetch_and_analyse(target_name):
     search = lk.search_lightcurve(target_name, mission="TESS", author="SPOC")
     if len(search) == 0: search = lk.search_lightcurve(target_name, mission="TESS")
     if len(search) == 0: raise ValueError(f"No TESS data for '{target_name}'")
+
+    # Phase 4: resolve TIC ID + live stellar params up front, once, so both
+    # the CNN and TransitFormer (and the PDF report) can use real Teff/
+    # radius/log g/Tmag when available instead of imputed neutral defaults.
+    tic_id = extract_tic_id(search[0])
+    stellar_params = fetch_stellar_params(tic_id) if tic_id is not None else {}
 
     lc = search[0].download(flux_column="pdcsap_flux")
     lc = lc.remove_nans().remove_outliers(sigma=5).normalize()
@@ -242,13 +289,17 @@ def fetch_and_analyse(target_name):
     gv      = _fold_bin(time, sf, period, t0, GLOBAL_LEN)
     lv      = _fold_bin(time, sf, period, t0, LOCAL_LEN, local=True)
 
-    probs, p_cnn, p_tf, attn = classify_with_ensemble(gv, lv, period, dur_hr, depth_ppm, snr)
+    probs, p_cnn, p_tf, attn = classify_with_ensemble(
+        gv, lv, period, dur_hr, depth_ppm, snr, stellar_params
+    )
     top_class = max(probs, key=probs.get)
     cdpp      = float(lc.estimate_cdpp().value) if hasattr(lc,"estimate_cdpp") else 200.0
     comp      = float(100*(1-np.isnan(lc.flux.value).sum()/len(lc.flux.value)))
 
     return {
         "target":       target_name,
+        "tic_id":       tic_id,
+        "stellar_params": stellar_params,
         "sector":       sector,
         "exptime_sec":  exptime,
         "n_cadences":   len(time),
@@ -313,8 +364,10 @@ def model_info():
     return jsonify({
         "phase":3,
         "device":str(DEVICE),
-        "cnn":{"loaded":CNN_MODEL is not None,"metrics":CNN_META},
-        "transformer":{"loaded":TF_MODEL is not None,"metrics":TF_META},
+        "cnn":{"loaded":CNN_MODEL is not None,"metrics":CNN_META,
+               "n_stellar": CNN_MODEL.n_stellar if CNN_MODEL else None},
+        "transformer":{"loaded":TF_MODEL is not None,"metrics":TF_META,
+                        "n_stellar": TF_MODEL.n_stellar if TF_MODEL else None},
         "ensemble_weights":{"cnn":0.45,"transformer":0.55} if ENSEMBLE else None,
         "mcmc_backend":"emcee 3.1 + batman 2.4",
     })

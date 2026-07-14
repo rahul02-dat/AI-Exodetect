@@ -15,6 +15,16 @@ Root causes fixed:
   3. TransitFormer not loaded → silent fallback to None
      caused p_transformer to be None in results.
      Fix: explicit CNN-only path with clear logging.
+
+Phase 4 update:
+  _classify() now builds each submodel's stellar feature tensor via the
+  shared stellar_features module, sized to that submodel's own
+  n_stellar — see stellar_features.py and the matching change in
+  server.py for the reasoning (avoids the CNN/TF stellar-feature formula
+  silently drifting between files, and lets CNN/TF be on different
+  schema versions during a gradual rollout). _process_one() now also
+  does a live TIC catalog lookup per target so real Teff/radius/log g/
+  Tmag values feed the expanded schema when a model expects it.
 """
 
 import sys, os
@@ -30,6 +40,9 @@ import torch.nn as nn
 import warnings, traceback, os, time
 from pathlib import Path
 warnings.filterwarnings("ignore")
+
+# Phase 4 import — shared stellar feature engineering (see module docstring)
+from stellar_features import build_stellar_features, extract_tic_id, fetch_stellar_params
 
 # ── Celery app ─────────────────────────────────────────────────────────────
 celery_app = Celery(
@@ -71,15 +84,6 @@ def _get_worker_models():
              else torch.device("cpu")
 
     # ── CNN ────────────────────────────────────────────────────────────────
-    class SafeAdaptiveAvgPool1d(nn.Module):
-        def __init__(self, output_size):
-            super().__init__()
-            self.pool = nn.AdaptiveAvgPool1d(output_size)
-        def forward(self, x):
-            if x.device.type == "mps":
-                return self.pool(x.cpu()).to(x.device)
-            return self.pool(x)
-
     class ConvBlock(nn.Module):
         def __init__(self, ic, oc, k=5, p=2):
             super().__init__()
@@ -91,20 +95,22 @@ def _get_worker_models():
     class ExoDetectCNN(nn.Module):
         def __init__(self, global_len=201, local_len=81, n_stellar=4):
             super().__init__()
-            self.global_branch = nn.Sequential(
+            self.n_stellar = n_stellar   # Phase 4: so _classify() can size this
+                                          # model's stellar tensor correctly.
+            self.gb = nn.Sequential(
                 ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
                 ConvBlock(32,64,5,2), ConvBlock(64,128,3,2),
-                SafeAdaptiveAvgPool1d(8), nn.Flatten())
-            self.local_branch = nn.Sequential(
+                nn.AdaptiveAvgPool1d(8), nn.Flatten())
+            self.lb = nn.Sequential(
                 ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
-                ConvBlock(32,64,3,2), SafeAdaptiveAvgPool1d(4), nn.Flatten())
+                ConvBlock(32,64,3,2), nn.AdaptiveAvgPool1d(4), nn.Flatten())
             fused = (128*8) + (64*4) + n_stellar
             self.head = nn.Sequential(
                 nn.Linear(fused,512), nn.ReLU(True), nn.Dropout(0.5),
                 nn.Linear(512,256),   nn.ReLU(True), nn.Dropout(0.3),
                 nn.Linear(256,2))
         def forward(self, gv, lv, sf):
-            return self.head(torch.cat([self.global_branch(gv), self.local_branch(lv), sf], 1))
+            return self.head(torch.cat([self.gb(gv), self.lb(lv), sf], 1))
 
     cnn = None
     if CNN_PATH.exists():
@@ -113,7 +119,7 @@ def _get_worker_models():
             cnn  = ExoDetectCNN(**ckpt["model_config"]).to(device)
             cnn.load_state_dict(ckpt["model_state_dict"])
             cnn.eval()
-            print(f"[Worker] CNN loaded on {device}")
+            print(f"[Worker] CNN loaded on {device} (n_stellar={cnn.n_stellar})")
         except Exception as e:
             print(f"[Worker] CNN load failed: {e}")
     else:
@@ -125,7 +131,7 @@ def _get_worker_models():
         try:
             from transit_transformer import load_transformer
             tf_model, _ = load_transformer(TRANSFORMER_PATH, device=device)
-            print(f"[Worker] TransitFormer loaded on {device}")
+            print(f"[Worker] TransitFormer loaded on {device} (n_stellar={tf_model.n_stellar})")
         except Exception as e:
             print(f"[Worker] TransitFormer load failed: {e}")
     else:
@@ -170,21 +176,18 @@ def _fold_bin(time, flux, period, t0, n_bins, local=False, lw=0.2):
     return view.astype(np.float32)
 
 
-def _classify(gv, lv, period, dur_hr, depth_ppm, snr, models):
+def _classify(gv, lv, period, dur_hr, depth_ppm, snr, models, stellar_params=None):
     """
-    Run CNN + optional TransitFormer, return p_planet, p_cnn, p_tf, attn.
-    Falls back gracefully at every stage.
+    Run CNN + optional TransitFormer, return p_planet, p_cnn, p_tf, probs, attn.
+    Falls back gracefully at every stage. Each submodel's stellar feature
+    vector is sized to that model's own n_stellar (see stellar_features.py),
+    so CNN and TransitFormer checkpoints can be on different schema
+    versions during a gradual rollout.
     """
+    stellar_params = stellar_params or {}
     device = models["device"]
     cnn    = models["cnn"]
     tf     = models["transformer"]
-
-    sf_np = np.array([[
-        float(np.log1p(period)),
-        float(np.log1p(max(dur_hr, 0))),
-        float(np.log1p(max(depth_ppm, 0))) / 10,
-        float(np.clip(snr, 0, 100)) / 100,
-    ]], dtype=np.float32)
 
     p_cnn, p_tf, attn = None, None, None
 
@@ -193,7 +196,12 @@ def _classify(gv, lv, period, dur_hr, depth_ppm, snr, models):
         try:
             gv_t = torch.tensor(gv).unsqueeze(0).unsqueeze(0).to(device)
             lv_t = torch.tensor(lv).unsqueeze(0).unsqueeze(0).to(device)
-            sf_t = torch.tensor(sf_np).to(device)
+            sf = build_stellar_features(
+                cnn.n_stellar, period, dur_hr, depth_ppm, snr,
+                stellar_params.get("teff"), stellar_params.get("rad"),
+                stellar_params.get("logg"), stellar_params.get("tmag"),
+            )
+            sf_t = torch.tensor([sf]).to(device)
             with torch.no_grad():
                 logits = cnn(gv_t, lv_t, sf_t)
                 p_cnn  = float(torch.softmax(logits, dim=1)[0, 1].item())
@@ -204,7 +212,12 @@ def _classify(gv, lv, period, dur_hr, depth_ppm, snr, models):
     if tf is not None and gv is not None:
         try:
             gv_t = torch.tensor(gv).unsqueeze(0).unsqueeze(0).to(device)
-            sf_t = torch.tensor(sf_np).to(device)
+            sf = build_stellar_features(
+                tf.n_stellar, period, dur_hr, depth_ppm, snr,
+                stellar_params.get("teff"), stellar_params.get("rad"),
+                stellar_params.get("logg"), stellar_params.get("tmag"),
+            )
+            sf_t = torch.tensor([sf]).to(device)
             p_tf_arr, attn_arr = tf.predict_proba(gv_t, sf_t)
             p_tf  = float(p_tf_arr[0])
             attn  = attn_arr[0].tolist() if attn_arr is not None else None
@@ -245,15 +258,21 @@ def _process_one(target_str, sector, models):
     Returns a result dict. Never raises — returns error dict on failure.
     """
     try:
-        # search_kw = {"mission": "TESS", "author": "SPOC"}
-        # if sector:
-        #     search_kw["sector"] = sector
+        search_kw = {"mission": "TESS", "author": "SPOC"}
+        if sector:
+            search_kw["sector"] = sector
 
-        search = lk.search_lightcurve(target_str, mission="TESS", author="SPOC")
+        search = lk.search_lightcurve(target_str, **search_kw)
         if len(search) == 0:
             search = lk.search_lightcurve(target_str, mission="TESS")
         if len(search) == 0:
             return {"tic_id": target_str, "status": "no_data"}
+
+        # Phase 4: resolve TIC ID + live stellar params once per target, so
+        # both submodels can use real Teff/radius/log g/Tmag when a model
+        # expects the expanded schema. Never blocks the scan if it fails.
+        tic_id_num = extract_tic_id(search[0])
+        stellar_params = fetch_stellar_params(tic_id_num) if tic_id_num is not None else {}
 
         lc = search[0].download(flux_column="pdcsap_flux")
         lc = lc.remove_nans().remove_outliers(sigma=5).normalize()
@@ -268,7 +287,7 @@ def _process_one(target_str, sector, models):
 
         # BLS
         bls     = BoxLeastSquares(time_arr, flux_arr, ferr_arr)
-        periods = np.linspace(0.6, 27.0, 3000)
+        periods = np.linspace(0.5, 27.0, 3000)
         power   = bls.power(periods, np.linspace(0.05, 0.5, 15))
         bi      = np.argmax(power.power)
         period  = float(power.period[bi])
@@ -291,12 +310,14 @@ def _process_one(target_str, sector, models):
 
         # Classify
         p_planet, p_cnn, p_tf, probs, attn = _classify(
-            gv, lv, period, dur_hr, depth_ppm, snr, models
+            gv, lv, period, dur_hr, depth_ppm, snr, models, stellar_params
         )
         top_class = max(probs, key=probs.get)
 
         return {
             "tic_id":           target_str,
+            "tic_id_num":       tic_id_num,
+            "stellar_params":   stellar_params,
             "status":           "ok",
             "period_days":      round(period, 4),
             "depth_pct":        round(depth * 100, 4),
@@ -382,7 +403,6 @@ def run_sector(self, sector_number, max_targets=10):
         # Sort by P(planet) descending
         ok_results = [r for r in results if r.get("status") == "ok"]
         ok_results.sort(key=lambda x: x.get("p_planet", 0), reverse=True)
-        failed = [r for r in results if r.get("status") != "ok"]
 
         self.update_state(state="PROGRESS",
                           meta={"step": "Finalising results…", "pct": 97,
@@ -394,7 +414,7 @@ def run_sector(self, sector_number, max_targets=10):
             "successful":       len(ok_results),
             "candidates":       len(candidates),
             "errors":           errors,
-            "top_candidates":   ok_results + failed,       # ALL ok results, sorted
+            "top_candidates":   ok_results,       # ALL ok results, sorted
             "status":           "done",
         }
 

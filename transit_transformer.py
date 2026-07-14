@@ -17,6 +17,15 @@ Architecture:
 Apple Silicon note:
   torch.backends.mps.is_available() is checked at runtime.
   All operations are MPS-compatible (no custom CUDA kernels).
+
+Phase 4 update:
+  TransitFormer now records its own n_stellar (self.n_stellar), and
+  ExoEnsemble.predict() builds each submodel's stellar feature tensor
+  internally via stellar_features.build_stellar_features(), sized to that
+  submodel's own n_stellar. This lets a CNN still on the legacy 4-feature
+  schema and a TransitFormer already retrained on the expanded 8-feature
+  schema (or vice versa) be ensembled together during a gradual rollout,
+  instead of requiring both models to be upgraded in lockstep.
 """
 
 import numpy as np
@@ -26,6 +35,8 @@ import torch.nn.functional as F
 import math
 import warnings
 warnings.filterwarnings("ignore")
+
+from stellar_features import build_stellar_features
 
 
 # ── Device ─────────────────────────────────────────────────────────────────
@@ -155,7 +166,8 @@ class TransitFormer(nn.Module):
 
     Input:
       global_view : (B, 1, 201)  — phase-folded, full orbit
-      stellar_feats: (B, 4)      — period, duration, depth, SNR
+      stellar_feats: (B, n_stellar) — period, duration, depth, SNR
+                       (+ Teff, radius, log g, Tmag if n_stellar=8)
 
     Output:
       logits       : (B, 2)      — planet / false-positive
@@ -168,6 +180,7 @@ class TransitFormer(nn.Module):
       n_heads    = 4
       n_layers   = 4
       ff_dim     = 256
+      n_stellar  = 4     (legacy) or 8 (expanded, includes host-star params)
     """
 
     def __init__(
@@ -186,6 +199,7 @@ class TransitFormer(nn.Module):
         self.seq_len    = seq_len
         self.patch_size = patch_size
         self.n_patches  = seq_len // patch_size
+        self.n_stellar  = n_stellar
 
         # Patch embedding
         self.patch_embed = PatchEmbedding(seq_len, patch_size, d_model)
@@ -290,22 +304,36 @@ class ExoEnsemble:
         self.w_tf  = tf_weight
         self.device = device or get_device()
 
-    def predict(self, global_view_t, local_view_t, stellar_t):
+    def predict(self, global_view_t, local_view_t, period, dur_hr, depth_ppm, snr,
+                teff=None, rad=None, logg=None, tmag=None):
         """
-        All inputs are torch tensors on self.device.
+        global_view_t / local_view_t are pre-built tensors on self.device.
+        Everything else is a raw (unnormalized) scalar — each submodel's
+        stellar feature tensor is built here internally, sized to that
+        submodel's own n_stellar (self.cnn.n_stellar / self.tf.n_stellar),
+        so mismatched schema versions between CNN and TransitFormer never
+        cause a shape error.
+
         Returns:
           p_planet      : float  — ensemble P(planet)
           p_cnn         : float  — CNN alone
           p_transformer : float  — TransitFormer alone
           attn_weights  : np.ndarray (n_patches,) — for XAI
         """
+        sf_cnn = build_stellar_features(self.cnn.n_stellar, period, dur_hr, depth_ppm, snr,
+                                         teff, rad, logg, tmag)
+        sf_tf  = build_stellar_features(self.tf.n_stellar, period, dur_hr, depth_ppm, snr,
+                                         teff, rad, logg, tmag)
+        sf_cnn_t = torch.tensor([sf_cnn]).to(self.device)
+        sf_tf_t  = torch.tensor([sf_tf]).to(self.device)
+
         # CNN
         with torch.no_grad():
-            cnn_logits = self.cnn(global_view_t, local_view_t, stellar_t)
+            cnn_logits = self.cnn(global_view_t, local_view_t, sf_cnn_t)
             p_cnn = float(torch.softmax(cnn_logits, dim=1)[:, 1].item())
 
         # TransitFormer
-        p_tf_arr, attn = self.tf.predict_proba(global_view_t, stellar_t)
+        p_tf_arr, attn = self.tf.predict_proba(global_view_t, sf_tf_t)
         p_tf = float(p_tf_arr[0])
 
         # Soft ensemble
@@ -334,7 +362,7 @@ class ExoEnsemble:
 
 # ── Training helper (used in training script) ─────────────────────────────
 
-def build_transformer(seq_len=201, patch_size=3, device=None):
+def build_transformer(seq_len=201, patch_size=3, n_stellar=4, device=None):
     """Instantiate a fresh TransitFormer and move to device."""
     device = device or get_device()
     model  = TransitFormer(
@@ -344,12 +372,12 @@ def build_transformer(seq_len=201, patch_size=3, device=None):
         n_heads    = 4,
         n_layers   = 4,
         ff_dim     = 256,
-        n_stellar  = 4,
+        n_stellar  = n_stellar,
         dropout    = 0.1,
         n_classes  = 2,
     ).to(device)
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[TransitFormer] {total:,} trainable parameters on {device}")
+    print(f"[TransitFormer] {total:,} trainable parameters on {device} (n_stellar={n_stellar})")
     return model
 
 
@@ -361,7 +389,8 @@ def load_transformer(path, device=None):
     model  = TransitFormer(**cfg).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"[TransitFormer] Loaded from {path} — Val AUC {ckpt.get('metrics',{}).get('best_val_auc','?')}")
+    print(f"[TransitFormer] Loaded from {path} — Val AUC {ckpt.get('metrics',{}).get('best_val_auc','?')} "
+          f"(n_stellar={model.n_stellar})")
     return model, ckpt.get("metrics", {})
 
 

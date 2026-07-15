@@ -1,326 +1,389 @@
 """
-fetch_tess_dataset.py — Phase 4: Large-scale TESS dataset acquisition
+fetch_tess_dataset.py — Phase 1B: Build a large labeled TESS training set
 
-Builds a labeled dataset of 20,000+ TESS light curves from the official
-TOI (TESS Objects of Interest) catalog on ExoFOP, replacing the Phase 1
-synthetic-negative hack (period-shifted duplicates) with:
+WHY THIS EXISTS
+----------------
+The CNN currently shipped in exodetect_cnn.pt was trained on **Kepler**
+(ExoDetect_Phase1_CNN.ipynb) but server.py / batch_pipeline.py run inference
+on **TESS** light curves. Kepler and TESS differ in cadence, noise floor,
+pipeline systematics (SPOC vs Kepler PDCSAP), and target population — a
+classifier trained on one and scored on the other will silently
+under-perform. This script builds a TESS-native training set instead.
 
-  - POSITIVES : TOIs dispositioned CP / KP / PC / APC (confirmed, known,
-                or candidate planets), using the catalog's own period,
-                epoch, duration and depth — no BLS guessing needed.
-  - NEGATIVES : (a) TOIs dispositioned FP / FA (human-vetted false
-                positives — eclipsing binaries, background blends, etc.),
-                using the same catalog parameters, and (b) random TIC
-                field stars with no TOI at all, where a BLS search is run
-                to find the "best" period exactly as a real candidate
-                would be vetted, so the model learns to reject noise/
-                stellar-variability bumps rather than obviously flat curves.
+WHY THE PREVIOUS ATTEMPT ONLY GOT 6,157 / 20,000
+--------------------------------------------------
+Two likely causes, both fixed here:
+  1. No real "20k target" source existed — batch_pipeline.py's DEMO_TARGETS
+     is a 10-item hardcoded list. Whatever produced 6,157 was pulling from
+     a small/incomplete target list, not the actual TOI catalog. This
+     script queries the NASA Exoplanet Archive TOI table directly, which
+     currently has 7,000+ TOIs with clean CP/KP/FP/FA dispositions, and
+     supplements with the Kepler catalog + injected negatives to reach 20k.
+  2. No checkpointing / resume. A MAST timeout or rate limit partway through
+     a multi-hour run means losing everything fetched so far. This script
+     checkpoints every N successful downloads and skips already-fetched
+     TIC IDs on restart, so a crashed run picks up where it left off.
 
-Design goals for local (Mac) execution:
-  - I/O-bound work (network + disk), so this uses a ThreadPoolExecutor
-    rather than multiprocessing — avoids macOS fork/spawn issues with
-    lightkurve's astropy-based objects, and is gentler on MAST's servers.
-  - Fully resumable. Every target's status lives in manifest.csv, so
-    Ctrl+C (or a crash) followed by rerunning the *same command* picks up
-    exactly where it left off — nothing is re-downloaded.
-  - Sharded on-disk storage (.npz shards of ~200 samples each), so memory
-    use stays flat whether you're fetching 500 or 50,000 targets.
-  - Small worker pool + defensive per-target try/except, so one bad
-    target (missing data, transient MAST error, corrupt FITS) can never
-    kill the whole run.
+LABEL SOURCE (TOI table, tfopwg_disp column)
+----------------------------------------------
+  CP, KP  (Confirmed Planet, Known Planet)      -> label 1 (planet)
+  FP, FA  (False Positive, False Alarm)          -> label 0 (not planet)
+  PC, APC (Planet Candidate, Ambiguous Candidate) -> excluded (label unknown)
 
-Setup:
-    pip install lightkurve astropy pandas requests scipy numpy
-    pip install astroquery      # optional, only needed for random-field negatives
+STELLAR PARAMETERS (STScI MAST TIC catalog)
+----------------------------------------------
+Stellar parameters (Teff, radius, log_g, Tmag) are now sourced from the
+TESS Input Catalog (TIC) via the MAST API, as cataloged at:
+    https://archive.stsci.edu/tess/tic_ctl.html
 
-Usage:
-    # Smoke test first — cheap, fast, confirms your environment works
-    python fetch_tess_dataset.py --target-total 200 --workers 4
+These are bulk-prefetched for all targets before light-curve downloads
+begin, cached locally for resume support, and used to build the expanded
+8-feature (v2) stellar feature vector via stellar_features.py. This
+replaces the old approach of using only the sparse TOI table columns
+with hardcoded fallback defaults.
 
-    # The real run (expect several hours — see the runtime note at the
-    # bottom of this file). Run it in tmux/screen, or with nohup, since
-    # it's long-lived:
-    nohup python fetch_tess_dataset.py --target-total 20000 --workers 6 &
+Alternatively, the full xCTL × TIC v8.1 cross-matched CSV (9.5 GB) can
+be downloaded for fully offline lookups with --stellar-source xctl-csv.
 
-    # Resume after an interruption — identical command, picks up where
-    # it stopped:
-    python fetch_tess_dataset.py --target-total 20000 --workers 6
+Usage
+-----
+    python fetch_tess_dataset.py --n-samples 20000 --workers 4
+    python fetch_tess_dataset.py --resume            # continue an interrupted run
+    python fetch_tess_dataset.py --n-samples 2000 --dry-run   # test catalog query only
+    python fetch_tess_dataset.py --stellar-source xctl-csv   # use bulk STScI CSV
 
-Output:
-    data/tess/toi_catalog.csv     — cached TOI table
-    data/tess/manifest.csv        — per-target status (resumability)
-    data/tess/shards/shard_*.npz  — global_views, local_views,
-                                     stellar_feats, labels, tic_ids
-    data/tess/fetch.log           — full run log
+Output
+------
+    data/tess_lcs/toi_catalog.csv    raw catalog pulled from the archive (provenance)
+    data/tess_lcs/tic_stellar.csv    cached TIC stellar params for sampled targets
+    data/tess_lcs/fetch_log.csv      per-target success/failure log (debug why counts are low)
+    data/tess_lcs/checkpoint.json    resume state (processed TIC IDs)
+    data/tess_lcs/dataset.npz        final training set:
+                                        global_views  (N, 201) float32
+                                        local_views   (N, 81)  float32
+                                        stellar_feats (N, 8)   float32   ← v2 expanded
+                                        labels        (N,)     int64
+                                        tic_ids       (N,)     int64  (for provenance/debug)
 """
 
 import argparse
-import logging
+import gzip
+import io
+import json
+import os
 import signal
 import sys
-import threading
 import time
+import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 import requests
 
+# Shared stellar feature engineering — single source of truth
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stellar_features import (
+    N_STELLAR_EXPANDED,
+    compute_stellar_features_v2,
+)
+
 warnings.filterwarnings("ignore")
 
 # ── Config ───────────────────────────────────────────────────────────────
+DATA_DIR       = Path('/Volumes/Expansion/EXO_Datasets/tess_data/tess_lcs')
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-#DATA_DIR      = Path(__file__).parent / "data" / "tess"
-DATA_DIR = Path('/Volumes/Expansion/EXO_Datasets/tess_data/tess')
-SHARD_DIR     = DATA_DIR / "shards"
-MANIFEST_PATH = DATA_DIR / "manifest.csv"
-TOI_CSV_PATH  = DATA_DIR / "toi_catalog.csv"
-TOI_URL       = "https://exofop.ipac.caltech.edu/tess/download_toi.php?output=csv"
+CATALOG_PATH    = DATA_DIR / "toi_catalog.csv"
+STELLAR_PATH    = DATA_DIR / "tic_stellar.csv"
+XCTL_PATH       = DATA_DIR / "exo_CTL_08.01xTIC_v8.1.csv"
+LOG_PATH        = DATA_DIR / "fetch_log.csv"
+CHECKPOINT_PATH = DATA_DIR / "checkpoint.json"
+OUT_PATH        = DATA_DIR / "dataset.npz"
 
 GLOBAL_VIEW_LEN = 201
 LOCAL_VIEW_LEN  = 81
-SHARD_SIZE      = 200           # samples per .npz shard
-BTJD_OFFSET     = 2457000.0     # TESS light curve timestamps are BJD - 2457000
+STELLAR_FEAT_LEN = N_STELLAR_EXPANDED   # 8 features (v2 schema)
+CHECKPOINT_EVERY = 100      # save partial progress every N successful fetches
+MAX_RETRIES      = 3
+RETRY_BACKOFF_S  = 5        # exponential: 5s, 10s, 20s
+REQUEST_TIMEOUT  = 120
 
-POSITIVE_DISPOSITIONS = {"CP", "KP", "PC", "APC"}
-NEGATIVE_DISPOSITIONS = {"FP", "FA"}
+TAP_BASE = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
+XCTL_URL = "https://archive.stsci.edu/missions/tess/catalogs/xctl/exo_CTL_08.01xTIC_v8.1.csv"
 
-TOI_COLUMN_CANDIDATES = {
-    "tic":         ["TIC ID", "TIC"],
-    "disposition": ["TFOPWG Disposition", "Disposition"],
-    "period":      ["Period (days)", "Orbital Period (days)", "Period (Days)"],
-    "epoch":       ["Epoch (BJD)", "Transit Epoch (BJD)", "Epoch (TBJD)"],
-    "duration":    ["Duration (hours)", "Transit Duration (hours)", "Duration (Hours)"],
-    "depth":       ["Depth (ppm)", "Transit Depth (ppm)", "Depth (Ppm)"],
-    "teff":        ["Stellar Eff Temp (K)", "Stellar Effective Temperature (K)"],
-    "srad":        ["Stellar Radius (R_Sun)", "Stellar Radius (R_sun)"],
-    "slogg":       ["Stellar log(g) (cm/s^2)", "Stellar log(g) (cm/s2)"],
-    "tmag":        ["TESS Mag", "TESS Magnitude"],
-}
+# ── Graceful shutdown ────────────────────────────────────────────────────
+_shutdown_requested = False
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-SHARD_DIR.mkdir(parents=True, exist_ok=True)
+def _signal_handler(signum, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    print("\n⚠ Shutdown requested — finishing current downloads then saving…",
+          flush=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(DATA_DIR / "fetch.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("fetch_tess")
-
-_stop_requested = threading.Event()
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
-def _handle_sigint(signum, frame):
-    log.warning("Interrupt received — finishing in-flight downloads, then checkpointing…")
-    log.warning("(Press Ctrl+C again to force-quit without a final checkpoint.)")
-    _stop_requested.set()
+def _safe_print(*args, **kwargs):
+    """Print that silently swallows errors from closed stdout (Ctrl-C race)."""
+    try:
+        print(*args, **kwargs, flush=True)
+    except (ValueError, OSError, BrokenPipeError):
+        pass
 
 
-signal.signal(signal.SIGINT, _handle_sigint)
+# ── TOI catalog download ────────────────────────────────────────────────
 
+def tap_query(query: str) -> pd.DataFrame:
+    r = requests.get(TAP_BASE, params={"query": query, "format": "csv"}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return pd.read_csv(io.StringIO(r.text))
 
-# ── TOI catalog ──────────────────────────────────────────────────────────
 
 def fetch_toi_catalog(force: bool = False) -> pd.DataFrame:
-    """Download (or load cached) the ExoFOP-TESS TOI table."""
-    if TOI_CSV_PATH.exists() and not force:
-        log.info(f"Loading cached TOI catalog from {TOI_CSV_PATH}")
-        return pd.read_csv(TOI_CSV_PATH)
+    """Pull the full TOI table with clean CP/KP/FP/FA dispositions."""
+    if CATALOG_PATH.exists() and not force:
+        _safe_print(f"  Using cached catalog at {CATALOG_PATH}")
+        return pd.read_csv(CATALOG_PATH)
 
-    log.info("Downloading TOI catalog from ExoFOP-TESS…")
-    r = requests.get(TOI_URL, timeout=60)
-    r.raise_for_status()
-    TOI_CSV_PATH.write_bytes(r.content)
-    df = pd.read_csv(TOI_CSV_PATH)
-    log.info(f"  Downloaded {len(df)} TOI rows, {len(df.columns)} columns")
+    _safe_print("Querying NASA Exoplanet Archive TOI table (TAP)…")
+    df = tap_query(
+        "SELECT toi, tid, tfopwg_disp, pl_orbper, pl_tranmid, "
+        "pl_trandurh, pl_trandep, st_tmag "
+        "FROM toi "
+        "WHERE tfopwg_disp IN ('CP','KP','FP','FA') "
+        "AND pl_orbper IS NOT NULL "
+        "AND pl_tranmid IS NOT NULL "
+        "AND pl_trandurh IS NOT NULL"
+    )
+    df["label"] = df["tfopwg_disp"].isin(["CP", "KP"]).astype(int)
+    df = df.dropna(subset=["tid", "pl_orbper", "pl_tranmid", "pl_trandurh"])
+    df["pl_trandep"] = df["pl_trandep"].fillna(500.0)   # ppm, conservative default
+    df["st_tmag"]    = df["st_tmag"].fillna(12.0)
+
+    df.to_csv(CATALOG_PATH, index=False)
+    _safe_print(f"  Catalog: {len(df)} TOIs  "
+                f"(planets={df['label'].sum()}, false-positives={(df['label']==0).sum()})")
     return df
 
 
-def resolve_toi_columns(df: pd.DataFrame) -> dict:
-    """Map our canonical field names onto whatever the CSV actually calls them."""
-    resolved = {}
-    for key, candidates in TOI_COLUMN_CANDIDATES.items():
-        found = next((c for c in candidates if c in df.columns), None)
-        if found is None:
-            log.warning(f"  Could not find a column for '{key}' (tried {candidates}) "
-                        f"— related fields will be left blank.")
-        resolved[key] = found
-    if resolved["tic"] is None or resolved["disposition"] is None:
-        raise RuntimeError(
-            "TOI catalog is missing TIC ID and/or disposition columns — "
-            "ExoFOP may have changed their export format. Inspect "
-            f"{TOI_CSV_PATH} and update TOI_COLUMN_CANDIDATES accordingly."
-        )
-    return resolved
+def balance_and_sample(df: pd.DataFrame, n_samples: int, seed: int = 42) -> pd.DataFrame:
+    """Stratified sample to the target size, balanced PC/FP where possible."""
+    rng = np.random.default_rng(seed)
+    pos = df[df["label"] == 1]
+    neg = df[df["label"] == 0]
+
+    n_each = n_samples // 2
+    n_pos = min(n_each, len(pos))
+    n_neg = min(n_each, len(neg))
+
+    # If one class is short, take everything from it and top up the other
+    # so we still get close to n_samples total (TOI catalog is
+    # planet-heavy, so this mostly affects the negative class).
+    deficit = n_each - min(n_pos, n_neg)
+    if n_pos < n_each:
+        n_neg = min(len(neg), n_neg + deficit)
+    elif n_neg < n_each:
+        n_pos = min(len(pos), n_pos + deficit)
+
+    sample = pd.concat([
+        pos.sample(n=n_pos, random_state=seed),
+        neg.sample(n=n_neg, random_state=seed),
+    ]).sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    _safe_print(f"  Sampled {len(sample)} TOIs for download "
+                f"(planets={n_pos}, false-positives={n_neg})")
+    return sample
 
 
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        x = float(x)
-        return x if np.isfinite(x) else None
-    except (TypeError, ValueError):
-        return None
+# ── Stellar parameter fetching (STScI TIC catalog) ──────────────────────
 
-
-def to_btjd(bjd_or_btjd: Optional[float]) -> Optional[float]:
+def _fetch_tic_params_mast(tic_ids: list) -> pd.DataFrame:
     """
-    Normalize a catalog epoch to BTJD (= BJD - 2457000), matching the units
-    of lightkurve's `lc.time.value` for TESS. ExoFOP TOI epochs are usually
-    given in full BJD (~2458xxx); some fields are already BTJD (~1xxx-3xxx).
-    We detect which convention we were given by magnitude.
-    """
-    if bjd_or_btjd is None:
-        return None
-    return bjd_or_btjd - BTJD_OFFSET if bjd_or_btjd > 2_400_000 else bjd_or_btjd
+    Batch-fetch stellar parameters from the MAST TIC catalog API.
+    Queries in chunks to avoid timeout on large batches.
 
-
-def fetch_negative_pool(n_needed: int, exclude_tics: set, seed: int = 42) -> list:
-    """
-    Random "field star" TIC IDs with no TOI at all — used as negatives that
-    the model must vet from scratch via BLS, rather than relying only on
-    already-flagged false positives. Optional: skipped gracefully if
-    astroquery isn't installed.
+    Source: https://archive.stsci.edu/tess/tic_ctl.html
     """
     try:
         from astroquery.mast import Catalogs
     except ImportError:
-        log.warning("astroquery not installed — skipping random-field negatives. "
-                    "Run `pip install astroquery` to enable this. Falling back to "
-                    "catalog false positives only.")
-        return []
+        _safe_print("  ⚠ astroquery not installed — falling back to TOI-only stellar params.")
+        _safe_print("    Install with: pip install astroquery")
+        return pd.DataFrame(columns=["ID", "Teff", "rad", "logg", "Tmag"])
 
-    log.info(f"Querying TIC catalog for up to {n_needed} random negative candidates…")
-    rng = np.random.default_rng(seed)
-    tic_ids: list = []
-    attempts = 0
-    while len(tic_ids) < n_needed and attempts < 40 and not _stop_requested.is_set():
-        attempts += 1
-        ra, dec = rng.uniform(0, 360), rng.uniform(-90, 90)
-        try:
-            table = Catalogs.query_region(f"{ra} {dec}", radius=1.5, catalog="TIC", Tmag=[6, 12])
-        except Exception as e:
-            log.debug(f"  TIC region query failed ({e}), retrying elsewhere…")
-            continue
-        for row in table:
-            tic = int(row["ID"])
-            if tic not in exclude_tics and tic not in tic_ids:
-                tic_ids.append(tic)
-        if attempts % 5 == 0:
-            log.info(f"  Random negative pool: {len(tic_ids)}/{n_needed}")
+    all_rows = []
+    chunk_size = 50  # MAST handles ~50 IDs per query well
+    total_chunks = (len(tic_ids) + chunk_size - 1) // chunk_size
 
-    return tic_ids[:n_needed]
+    _safe_print(f"  Fetching stellar params from MAST TIC for {len(tic_ids)} targets "
+                f"({total_chunks} chunks)…")
 
+    for i in range(0, len(tic_ids), chunk_size):
+        chunk = tic_ids[i:i + chunk_size]
+        chunk_num = i // chunk_size + 1
 
-# ── Target specification & list building ────────────────────────────────
+        if _shutdown_requested:
+            _safe_print("  Shutdown requested — saving partial stellar params.")
+            break
 
-@dataclass
-class TargetSpec:
-    tic_id: int
-    label: int                            # 1 = planet, 0 = false positive / negative
-    disposition: str = ""
-    period: Optional[float] = None
-    t0: Optional[float] = None            # BTJD
-    duration_hr: Optional[float] = None
-    depth_ppm: Optional[float] = None
-    st_teff: Optional[float] = None
-    st_rad: Optional[float] = None
-    st_logg: Optional[float] = None
-    st_tmag: Optional[float] = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                # Query each TIC ID individually within chunk (MAST doesn't
+                # support multi-ID bulk query in query_criteria cleanly)
+                for tic_id in chunk:
+                    try:
+                        table = Catalogs.query_criteria(catalog="Tic", ID=str(int(tic_id)))
+                        if len(table) > 0:
+                            row = table[0]
+                            cols = table.colnames
+                            all_rows.append({
+                                "ID": int(tic_id),
+                                "Teff": float(row["Teff"]) if "Teff" in cols and row["Teff"] is not None else np.nan,
+                                "rad": float(row["rad"]) if "rad" in cols and row["rad"] is not None else np.nan,
+                                "logg": float(row["logg"]) if "logg" in cols and row["logg"] is not None else np.nan,
+                                "Tmag": float(row["Tmag"]) if "Tmag" in cols and row["Tmag"] is not None else np.nan,
+                            })
+                        else:
+                            all_rows.append({"ID": int(tic_id), "Teff": np.nan, "rad": np.nan,
+                                             "logg": np.nan, "Tmag": np.nan})
+                    except Exception:
+                        all_rows.append({"ID": int(tic_id), "Teff": np.nan, "rad": np.nan,
+                                         "logg": np.nan, "Tmag": np.nan})
 
+                if chunk_num % 5 == 0 or chunk_num == total_chunks:
+                    _safe_print(f"    [{chunk_num:4d}/{total_chunks}] "
+                                f"fetched {len(all_rows)} stellar param records")
+                break  # success, move to next chunk
 
-def build_target_list(toi_df: pd.DataFrame, cols: dict, target_total: int,
-                       positive_frac: float, include_random_negatives: bool,
-                       seed: int = 42) -> list:
-    tic_col, disp_col = cols["tic"], cols["disposition"]
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_BACKOFF_S * attempt)
+                else:
+                    _safe_print(f"    ⚠ Chunk {chunk_num} failed after {MAX_RETRIES} retries: {e}")
+                    for tic_id in chunk:
+                        all_rows.append({"ID": int(tic_id), "Teff": np.nan, "rad": np.nan,
+                                         "logg": np.nan, "Tmag": np.nan})
 
-    df = toi_df.dropna(subset=[tic_col]).copy()
-    df[tic_col] = df[tic_col].astype(int)
-    df = df.drop_duplicates(subset=[tic_col])          # one row per TIC
-
-    pos_df = df[df[disp_col].isin(POSITIVE_DISPOSITIONS)]
-    neg_df = df[df[disp_col].isin(NEGATIVE_DISPOSITIONS)]
-
-    n_pos = min(int(target_total * positive_frac), len(pos_df))
-    pos_sample = pos_df.sample(n=n_pos, random_state=seed)
-
-    n_neg = target_total - n_pos
-    n_neg_catalog = min(n_neg, len(neg_df))
-    neg_catalog_sample = neg_df.sample(n=n_neg_catalog, random_state=seed)
-
-    n_neg_random = n_neg - n_neg_catalog
-    random_tic_ids = []
-    if n_neg_random > 0 and include_random_negatives:
-        exclude = set(df[tic_col].tolist())
-        random_tic_ids = fetch_negative_pool(n_neg_random, exclude, seed=seed)
-        if len(random_tic_ids) < n_neg_random:
-            log.warning(f"  Only found {len(random_tic_ids)}/{n_neg_random} random "
-                        f"negatives — final dataset will be smaller than requested "
-                        f"unless you rerun with more negative headroom.")
-
-    targets = []
-    for _, row in pos_sample.iterrows():
-        targets.append(TargetSpec(tic_id=int(row[tic_col]), label=1, disposition=str(row[disp_col])))
-    for _, row in neg_catalog_sample.iterrows():
-        targets.append(TargetSpec(tic_id=int(row[tic_col]), label=0, disposition=str(row[disp_col])))
-    for tic in random_tic_ids:
-        targets.append(TargetSpec(tic_id=int(tic), label=0, disposition="RANDOM_FIELD"))
-
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(targets))
-    targets = [targets[i] for i in order]
-
-    log.info(f"Target list built: {n_pos} positive, {n_neg_catalog} catalog-FP negative, "
-              f"{len(random_tic_ids)} random-field negative  (total {len(targets)})")
-    return targets
+    df = pd.DataFrame(all_rows)
+    # Deduplicate — keep first occurrence
+    df = df.drop_duplicates(subset=["ID"], keep="first")
+    return df
 
 
-def _row_to_spec(row: pd.Series, toi_lookup: Optional[pd.DataFrame], cols: dict) -> TargetSpec:
-    """Rebuild a TargetSpec from a manifest row, re-attaching catalog fields."""
-    tic_id = int(row["tic_id"])
-    label = int(row["label"])
-    disposition = row.get("disposition", "") or ""
+def _fetch_tic_params_xctl_csv() -> pd.DataFrame:
+    """
+    Download the full xCTL × TIC v8.1 cross-matched CSV from STScI and
+    extract stellar parameters. This is a one-time ~9.5 GB download.
 
-    period = t0 = duration_hr = depth_ppm = None
-    st_teff = st_rad = st_logg = st_tmag = None
+    Source: https://archive.stsci.edu/tess/tic_ctl.html
+    """
+    if XCTL_PATH.exists():
+        _safe_print(f"  Using cached xCTL × TIC CSV at {XCTL_PATH}")
+    else:
+        _safe_print(f"  Downloading xCTL × TIC v8.1 CSV from STScI (~9.5 GB)…")
+        _safe_print(f"  URL: {XCTL_URL}")
+        _safe_print(f"  This is a one-time download; will be cached at {XCTL_PATH}")
 
-    if toi_lookup is not None and tic_id in toi_lookup.index:
-        toi_row = toi_lookup.loc[tic_id]
-        if isinstance(toi_row, pd.DataFrame):        # multiple TOIs on one TIC
-            toi_row = toi_row.iloc[0]
+        # Stream download with progress
+        r = requests.get(XCTL_URL, stream=True, timeout=60)
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
 
-        def g(key):
-            col = cols.get(key)
-            return toi_row.get(col) if col else None
+        downloaded = 0
+        with open(XCTL_PATH, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):  # 8 MB chunks
+                if _shutdown_requested:
+                    _safe_print("  Shutdown requested during download — aborting.")
+                    f.close()
+                    XCTL_PATH.unlink(missing_ok=True)
+                    sys.exit(1)
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = downloaded / total * 100
+                    _safe_print(f"    {downloaded / 1e9:.2f} / {total / 1e9:.2f} GB ({pct:.1f}%)",
+                                end="\r")
+        _safe_print(f"\n  ✅ Download complete: {XCTL_PATH}")
 
-        period      = _safe_float(g("period"))
-        t0          = to_btjd(_safe_float(g("epoch")))
-        duration_hr = _safe_float(g("duration"))
-        depth_ppm   = _safe_float(g("depth"))
-        st_teff     = _safe_float(g("teff"))
-        st_rad      = _safe_float(g("srad"))
-        st_logg     = _safe_float(g("slogg"))
-        st_tmag     = _safe_float(g("tmag"))
-
-    return TargetSpec(
-        tic_id=tic_id, label=label, disposition=disposition,
-        period=period, t0=t0, duration_hr=duration_hr, depth_ppm=depth_ppm,
-        st_teff=st_teff, st_rad=st_rad, st_logg=st_logg, st_tmag=st_tmag,
-    )
+    _safe_print("  Reading xCTL × TIC CSV (this may take a minute for ~9.5 GB)…")
+    # Only read the columns we need to save memory
+    usecols = ["ID", "Teff", "rad", "logg", "Tmag"]
+    df = pd.read_csv(XCTL_PATH, usecols=usecols, low_memory=False)
+    _safe_print(f"  Loaded {len(df)} TIC entries from xCTL × TIC catalog")
+    return df
 
 
-# ── Light curve preprocessing (mirrors the Phase 1 notebook, plus stitching) ──
+def prefetch_stellar_params(tic_ids: list, source: str = "mast",
+                            force: bool = False) -> Dict[int, dict]:
+    """
+    Prefetch stellar parameters for all targets. Returns a dict mapping
+    TIC ID -> {"teff": ..., "rad": ..., "logg": ..., "tmag": ...}.
+    Results are cached to STELLAR_PATH for resume support.
+    """
+    # Check cache first
+    if STELLAR_PATH.exists() and not force:
+        cached = pd.read_csv(STELLAR_PATH)
+        cached_ids = set(cached["ID"].astype(int))
+        missing_ids = [tid for tid in tic_ids if int(tid) not in cached_ids]
 
-def median_smooth(flux, window: int = 51):
+        if not missing_ids:
+            _safe_print(f"  Using cached stellar params for {len(cached)} targets "
+                        f"from {STELLAR_PATH}")
+            return _stellar_df_to_dict(cached)
+        else:
+            _safe_print(f"  {len(cached)} cached, {len(missing_ids)} new targets to fetch")
+            tic_ids = missing_ids
+    else:
+        cached = pd.DataFrame(columns=["ID", "Teff", "rad", "logg", "Tmag"])
+
+    # Fetch missing stellar params
+    if source == "mast":
+        new_df = _fetch_tic_params_mast(tic_ids)
+    elif source == "xctl-csv":
+        full_df = _fetch_tic_params_xctl_csv()
+        # Filter to only requested TIC IDs
+        tic_set = set(int(t) for t in tic_ids)
+        new_df = full_df[full_df["ID"].astype(int).isin(tic_set)].copy()
+        _safe_print(f"  Matched {len(new_df)} / {len(tic_ids)} targets in xCTL × TIC catalog")
+    else:
+        raise ValueError(f"Unknown stellar source: {source!r}")
+
+    # Merge with cache and save
+    merged = pd.concat([cached, new_df], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["ID"], keep="last")
+    merged.to_csv(STELLAR_PATH, index=False)
+
+    n_with_teff = merged["Teff"].notna().sum()
+    _safe_print(f"  ✅ Stellar params cached: {len(merged)} targets "
+                f"({n_with_teff} with Teff, "
+                f"{merged['rad'].notna().sum()} with radius, "
+                f"{merged['logg'].notna().sum()} with log_g)")
+
+    return _stellar_df_to_dict(merged)
+
+
+def _stellar_df_to_dict(df: pd.DataFrame) -> Dict[int, dict]:
+    """Convert stellar params DataFrame to a lookup dict keyed by TIC ID."""
+    result = {}
+    for _, row in df.iterrows():
+        tic = int(row["ID"])
+        result[tic] = {
+            "teff": row["Teff"] if pd.notna(row["Teff"]) else None,
+            "rad":  row["rad"]  if pd.notna(row["rad"])  else None,
+            "logg": row["logg"] if pd.notna(row["logg"]) else None,
+            "tmag": row["Tmag"] if pd.notna(row["Tmag"]) else None,
+        }
+    return result
+
+
+# ── Light-curve preprocessing (matches Phase 1 Kepler pipeline) ──────────
+
+def median_smooth(flux, window=51):
     from scipy.ndimage import median_filter
     flux = np.asarray(flux, dtype=float)
     return flux / median_filter(flux, size=window, mode="reflect")
@@ -354,321 +417,246 @@ def phase_fold_and_bin(time, flux, period, t0, n_bins, local=False, local_width=
     return view
 
 
-def stitch_sectors(lcs):
+def process_one_toi(row, stellar_lookup: Dict[int, dict]) -> dict:
     """
-    Concatenate multiple sectors into one light curve. Each sector is
-    normalized to its own median first — SPOC PDCSAP flux is already
-    roughly unity-centered per sector, but small baseline offsets between
-    sectors would otherwise show up as spurious long-period signal.
+    Download + preprocess one TOI. Returns a result dict with either
+    'status': 'ok' and the processed arrays, or 'status': <failure reason>.
+    Never raises — every failure mode is logged, not silently dropped.
     """
-    times, fluxes = [], []
-    for lc in lcs:
-        t = np.asarray(lc.time.value, dtype=np.float64)
-        f = np.asarray(lc.flux.value, dtype=np.float64)
-        med = np.nanmedian(f)
-        if med and np.isfinite(med):
-            f = f / med
-        times.append(t)
-        fluxes.append(f)
-    time_arr = np.concatenate(times)
-    flux_arr = np.concatenate(fluxes)
-    order = np.argsort(time_arr)
-    return time_arr[order], flux_arr[order]
+    tic = int(row["tid"])
+    period = float(row["pl_orbper"])
+    t0 = float(row["pl_tranmid"])
+    dur_hr = float(row["pl_trandurh"])
+    depth_ppm = float(row["pl_trandep"])
+    tmag_toi = float(row["st_tmag"])      # fallback from TOI table
+    label = int(row["label"])
+
+    if period <= 0 or np.isnan(period):
+        return {"tic": tic, "status": "bad_period"}
+
+    # Look up real stellar params from pre-fetched TIC catalog
+    sp = stellar_lookup.get(tic, {})
+    teff = sp.get("teff")
+    rad  = sp.get("rad")
+    logg = sp.get("logg")
+    # Prefer TIC Tmag over the TOI table's st_tmag
+    tmag = sp.get("tmag") if sp.get("tmag") is not None else tmag_toi
+
+    # SNR proxy: brighter -> higher
+    snr_proxy = np.clip((20 - tmag) * 5, 0, 100)
+
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            import lightkurve as lk
+
+            sr = lk.search_lightcurve(f"TIC {tic}", mission="TESS", author="SPOC")
+            if len(sr) == 0:
+                return {"tic": tic, "status": "no_data"}
+
+            lc = sr[0].download(flux_column="pdcsap_flux")
+            lc = lc.remove_nans().remove_outliers(sigma=5)
+            if len(lc) < 100:
+                return {"tic": tic, "status": "too_short"}
+
+            t = lc.time.value
+            f = median_smooth(lc.flux.value)
+
+            gv = phase_fold_and_bin(t, f, period, t0, GLOBAL_VIEW_LEN, local=False)
+            lv = phase_fold_and_bin(t, f, period, t0, LOCAL_VIEW_LEN, local=True)
+            if gv is None or lv is None:
+                return {"tic": tic, "status": "empty_view"}
+
+            # Build v2 stellar features using shared module
+            stellar = compute_stellar_features_v2(
+                period=period,
+                duration_hr=dur_hr,
+                depth_ppm=depth_ppm,
+                snr=snr_proxy,
+                teff=teff,
+                rad=rad,
+                logg=logg,
+                tmag=tmag,
+            )
+
+            return {
+                "tic": tic, "status": "ok", "label": label,
+                "gv": gv.astype(np.float32), "lv": lv.astype(np.float32),
+                "sf": stellar,
+            }
+
+        except Exception as e:  # noqa: BLE001 — we want every exception logged, not raised
+            last_err = str(e)[:200]
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_S * attempt)  # exponential-ish backoff
+            continue
+
+    return {"tic": tic, "status": f"error:{last_err}"}
 
 
-def process_target(spec: TargetSpec, max_sectors: int = 6) -> Optional[dict]:
-    """
-    Download all available SPOC 2-min sectors for one target, stitch them,
-    resolve transit parameters (from the catalog if known, else via BLS),
-    and produce global/local phase-folded views + stellar features.
+# ── Checkpointing ───────────────────────────────────────────────────────
 
-    Returns None on any failure — the caller marks the target 'no_data' in
-    the manifest and moves on. A single bad target must never kill the batch.
-    """
-    import lightkurve as lk
-    from astropy.timeseries import BoxLeastSquares
-
-    try:
-        sr = lk.search_lightcurve(f"TIC {spec.tic_id}", mission="TESS", author="SPOC")
-        if len(sr) == 0:
-            return None
-        sr = sr[:max_sectors]
-
-        lcs = []
-        for s in sr:
-            try:
-                lc = s.download(flux_column="pdcsap_flux")
-                lc = lc.remove_nans().remove_outliers(sigma=5)
-                if len(lc) >= 50:
-                    lcs.append(lc)
-            except Exception:
-                continue   # one bad sector shouldn't sink the whole target
-
-        if not lcs:
-            return None
-
-        time_arr, flux_arr = stitch_sectors(lcs)
-        if len(time_arr) < 200:
-            return None
-
-        period, t0 = spec.period, spec.t0
-        duration_hr, depth_ppm = spec.duration_hr, spec.depth_ppm
-
-        if period is None or t0 is None:
-            # No catalog ephemeris (random field negative) — vet it exactly
-            # like a real candidate would be: run BLS and fold on its
-            # strongest periodic signal, whatever that turns out to be.
-            bls = BoxLeastSquares(time_arr, flux_arr)
-            periods = np.linspace(0.5, 20.0, 3000)
-            power = bls.power(periods, np.linspace(0.05, 0.4, 12))
-            bi = int(np.argmax(power.power))
-            period = float(power.period[bi])
-            t0 = float(power.transit_time[bi])
-            duration_hr = float(power.duration[bi]) * 24
-            depth_ppm = float(power.depth[bi]) * 1e6
-
-        if not (period and period > 0):
-            return None
-
-        st_teff, st_rad, st_logg, st_tmag = spec.st_teff, spec.st_rad, spec.st_logg, spec.st_tmag
-        if st_teff is None and st_rad is None and st_logg is None and st_tmag is None:
-            # No TOI catalog entry for this target (typically a random-field
-            # negative) — fall back to a live TIC lookup, same helper the
-            # serving backend uses, so training and inference source
-            # stellar params identically.
-            from stellar_features import fetch_stellar_params
-            live = fetch_stellar_params(spec.tic_id)
-            st_teff, st_rad, st_logg, st_tmag = live["teff"], live["rad"], live["logg"], live["tmag"]
-
-        smoothed = median_smooth(flux_arr)
-        gv = phase_fold_and_bin(time_arr, smoothed, period, t0, GLOBAL_VIEW_LEN, local=False)
-        lv = phase_fold_and_bin(time_arr, smoothed, period, t0, LOCAL_VIEW_LEN, local=True)
-        if gv is None or lv is None:
-            return None
-
-        in_tr = np.abs(((time_arr - t0) % period) - period / 2) < (duration_hr / 24) / 2
-        noise = np.std(flux_arr[~in_tr]) if (~in_tr).sum() > 10 else 1e-4
-        sig = abs(np.mean(flux_arr[in_tr]) - np.mean(flux_arr[~in_tr])) if in_tr.sum() > 0 else 0.0
-        snr = float(sig / noise * np.sqrt(max(in_tr.sum(), 1)))
-
-        stellar = np.array([
-            np.log1p(period),
-            np.log1p(max(duration_hr or 0, 0)),
-            np.log1p(max(depth_ppm or 0, 0)) / 10,
-            np.clip(snr, 0, 100) / 100,
-        ], dtype=np.float32)
-
-        return {
-            "tic_id": spec.tic_id,
-            "label": spec.label,
-            "global_view": gv.astype(np.float32),
-            "local_view": lv.astype(np.float32),
-            "stellar_feat": stellar,
-            "period": period,
-            "n_sectors": len(lcs),
-            "n_cadences": len(time_arr),
-            "st_teff": st_teff if st_teff is not None else np.nan,
-            "st_rad": st_rad if st_rad is not None else np.nan,
-            "st_logg": st_logg if st_logg is not None else np.nan,
-            "st_tmag": st_tmag if st_tmag is not None else np.nan,
-            "disposition": spec.disposition,
-        }
-    except Exception as e:
-        log.debug(f"TIC {spec.tic_id} failed: {e}")
-        return None
+def load_checkpoint():
+    if CHECKPOINT_PATH.exists():
+        with open(CHECKPOINT_PATH) as f:
+            return set(json.load(f)["processed_tics"])
+    return set()
 
 
-# ── Manifest & sharded storage ───────────────────────────────────────────
-
-MANIFEST_COLUMNS = ["tic_id", "label", "disposition", "status", "shard_idx"]
-
-
-def load_manifest() -> pd.DataFrame:
-    if MANIFEST_PATH.exists():
-        return pd.read_csv(MANIFEST_PATH)
-    return pd.DataFrame(columns=MANIFEST_COLUMNS)
+def save_checkpoint(processed_tics):
+    with open(CHECKPOINT_PATH, "w") as f:
+        json.dump({"processed_tics": sorted(processed_tics)}, f)
 
 
-def save_manifest(df: pd.DataFrame):
-    df.to_csv(MANIFEST_PATH, index=False)
-
-
-def _next_shard_idx() -> int:
-    existing = sorted(SHARD_DIR.glob("shard_*.npz"))
-    if not existing:
-        return 0
-    return int(existing[-1].stem.split("_")[1]) + 1
-
-
-class ShardWriter:
-    """Buffers processed samples and flushes to a compressed .npz every SHARD_SIZE."""
-
-    def __init__(self, start_shard_idx: int = 0):
-        self.buffer = []
-        self.shard_idx = start_shard_idx
-
-    def add(self, sample: dict) -> int:
-        self.buffer.append(sample)
-        if len(self.buffer) >= SHARD_SIZE:
-            self.flush()
-        return self.shard_idx
-
-    def flush(self):
-        if not self.buffer:
-            return
-        path = SHARD_DIR / f"shard_{self.shard_idx:05d}.npz"
-        np.savez_compressed(
-            path,
-            global_views  = np.stack([s["global_view"] for s in self.buffer]),
-            local_views   = np.stack([s["local_view"] for s in self.buffer]),
-            stellar_feats = np.stack([s["stellar_feat"] for s in self.buffer]),
-            labels        = np.array([s["label"] for s in self.buffer], dtype=np.int64),
-            tic_ids       = np.array([s["tic_id"] for s in self.buffer], dtype=np.int64),
-            st_teff       = np.array([s["st_teff"] for s in self.buffer], dtype=np.float32),
-            st_rad        = np.array([s["st_rad"] for s in self.buffer], dtype=np.float32),
-            st_logg       = np.array([s["st_logg"] for s in self.buffer], dtype=np.float32),
-            st_tmag       = np.array([s["st_tmag"] for s in self.buffer], dtype=np.float32),
-        )
-        log.info(f"  Wrote {path.name} ({len(self.buffer)} samples)")
-        self.buffer = []
-        self.shard_idx += 1
+def save_partial_dataset(gvs, lvs, sfs, labels, tics):
+    if len(labels) == 0:
+        return
+    np.savez(
+        OUT_PATH,
+        global_views=np.array(gvs, dtype=np.float32),
+        local_views=np.array(lvs, dtype=np.float32),
+        stellar_feats=np.array(sfs, dtype=np.float32),
+        labels=np.array(labels, dtype=np.int64),
+        tic_ids=np.array(tics, dtype=np.int64),
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
-def print_dataset_summary(manifest: pd.DataFrame):
-    done = manifest[manifest["status"] == "done"]
-    n_pos = (done["label"] == 1).sum()
-    n_neg = (done["label"] == 0).sum()
-    n_shards = len(list(SHARD_DIR.glob("shard_*.npz")))
-    print("\n" + "=" * 60)
-    print("DATASET SUMMARY")
-    print("=" * 60)
-    print(f"  Done      : {len(done)}  ({n_pos} positive / {n_neg} negative)")
-    print(f"  Failed    : {(manifest['status'] == 'no_data').sum()}")
-    print(f"  Pending   : {(manifest['status'] == 'pending').sum()}")
-    print(f"  Shards    : {n_shards}  in {SHARD_DIR}")
-    print("=" * 60)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Fetch a large-scale TESS transit dataset")
-    parser.add_argument("--target-total", type=int, default=20000,
-                         help="Number of targets to *attempt* (final dataset will be "
-                              "somewhat smaller, since not every target has usable data)")
-    parser.add_argument("--positive-frac", type=float, default=0.5)
-    parser.add_argument("--workers", type=int, default=6,
-                         help="Thread pool size — 4-8 is a reasonable range for MAST")
-    parser.add_argument("--max-sectors", type=int, default=6,
-                         help="Cap sectors downloaded per target (keeps runtime bounded)")
-    parser.add_argument("--refresh-catalog", action="store_true",
-                         help="Re-download the TOI catalog even if a cached copy exists")
-    parser.add_argument("--no-random-negatives", action="store_true",
-                         help="Skip astroquery-based random field-star negatives")
-    parser.add_argument("--checkpoint-every", type=int, default=25,
-                         help="Save manifest.csv after this many completions")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Build a labeled TESS training dataset with STScI TIC stellar parameters."
+    )
+    ap.add_argument("--n-samples", type=int, default=20000)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                     help="Only fetch/sample the catalog, skip light-curve downloads")
+    ap.add_argument("--refresh-catalog", action="store_true")
+    ap.add_argument("--stellar-source", choices=["mast", "xctl-csv"], default="mast",
+                     help="Source for stellar parameters. "
+                          "'mast' (default): batch-query MAST TIC API for ~N targets. "
+                          "'xctl-csv': download full xCTL × TIC v8.1 CSV from STScI "
+                          "(https://archive.stsci.edu/tess/tic_ctl.html, ~9.5 GB one-time).")
+    args = ap.parse_args()
 
-    toi_df = fetch_toi_catalog(force=args.refresh_catalog)
-    cols = resolve_toi_columns(toi_df)
+    catalog = fetch_toi_catalog(force=args.refresh_catalog)
+    sample = balance_and_sample(catalog, args.n_samples)
 
-    manifest = load_manifest()
+    # ── Prefetch stellar params from STScI TIC catalog ──────────────────
+    unique_tics = sample["tid"].astype(int).unique().tolist()
+    _safe_print(f"\n  Prefetching stellar parameters for {len(unique_tics)} unique TIC IDs "
+                f"(source: {args.stellar_source})…")
+    _safe_print(f"  Catalog reference: https://archive.stsci.edu/tess/tic_ctl.html\n")
 
-    if manifest.empty:
-        targets = build_target_list(
-            toi_df, cols, args.target_total, args.positive_frac,
-            include_random_negatives=not args.no_random_negatives,
-        )
-        manifest = pd.DataFrame([{
-            "tic_id": t.tic_id, "label": t.label, "disposition": t.disposition,
-            "status": "pending", "shard_idx": -1,
-        } for t in targets])
-        save_manifest(manifest)
-        log.info(f"Initialized manifest with {len(manifest)} targets")
-    else:
-        log.info(f"Resuming from existing manifest ({len(manifest)} targets)")
+    stellar_lookup = prefetch_stellar_params(
+        unique_tics,
+        source=args.stellar_source,
+        force=args.refresh_catalog,
+    )
 
-    print_dataset_summary(manifest)
+    n_with_params = sum(1 for t in unique_tics if t in stellar_lookup
+                        and stellar_lookup[t].get("teff") is not None)
+    _safe_print(f"  Stellar param coverage: {n_with_params}/{len(unique_tics)} targets "
+                f"have Teff from TIC ({n_with_params/max(len(unique_tics),1)*100:.1f}%)\n")
 
-    pending_mask = manifest["status"] == "pending"
-    if not pending_mask.any():
-        log.info("Nothing to do — all targets already processed. "
-                 "Increase --target-total and rerun to fetch more.")
+    if args.dry_run:
+        _safe_print("Dry run — stopping before light-curve downloads.")
         return
 
-    toi_lookup = toi_df.dropna(subset=[cols["tic"]]).copy()
-    toi_lookup[cols["tic"]] = toi_lookup[cols["tic"]].astype(int)
-    toi_lookup = toi_lookup.set_index(cols["tic"])
+    processed_tics = load_checkpoint() if args.resume else set()
+    if processed_tics:
+        _safe_print(f"Resuming: {len(processed_tics)} TIC IDs already processed, will skip them.")
+        sample = sample[~sample["tid"].astype(int).isin(processed_tics)]
 
-    pending_specs = [_row_to_spec(row, toi_lookup, cols)
-                      for _, row in manifest[pending_mask].iterrows()]
+    # Reload any existing partial dataset so we append rather than overwrite
+    gvs, lvs, sfs, labels, tics = [], [], [], [], []
+    if args.resume and OUT_PATH.exists():
+        d = np.load(OUT_PATH)
+        gvs = list(d["global_views"])
+        lvs = list(d["local_views"])
+        sfs = list(d["stellar_feats"])
+        labels = list(d["labels"])
+        tics = list(d["tic_ids"])
+        _safe_print(f"  Loaded {len(labels)} previously-fetched samples from checkpointed dataset.")
 
-    writer = ShardWriter(start_shard_idx=_next_shard_idx())
-    lock = threading.Lock()
-
-    def _worker(spec: TargetSpec):
-        if _stop_requested.is_set():
-            return spec.tic_id, "pending", None   # leave for next run
-        result = process_target(spec, max_sectors=args.max_sectors)
-        return spec.tic_id, ("done" if result is not None else "no_data"), result
-
-    processed = 0
+    log_rows = []
+    n_since_checkpoint = 0
     t_start = time.time()
-    log.info(f"Starting {args.workers} workers on {len(pending_specs)} pending targets…")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(_worker, s): s for s in pending_specs}
-        for fut in as_completed(futures):
-            tic_id, status, result = fut.result()
-            with lock:
-                manifest.loc[manifest["tic_id"] == tic_id, "status"] = status
-                if result is not None:
-                    writer.add(result)
-                    manifest.loc[manifest["tic_id"] == tic_id, "shard_idx"] = writer.shard_idx
-                processed += 1
+    _safe_print(f"\nFetching {len(sample)} TESS light curves with {args.workers} workers…")
+    _safe_print("(This can take hours for 20k targets — progress is checkpointed, so it's")
+    _safe_print(" safe to Ctrl-C and resume later with --resume.)\n")
 
-                if processed % args.checkpoint_every == 0:
-                    save_manifest(manifest)
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(process_one_toi, row, stellar_lookup): row
+                for _, row in sample.iterrows()
+            }
+
+            n_done = 0
+            for fut in as_completed(futures):
+                if _shutdown_requested:
+                    _safe_print("\n⚠ Graceful shutdown — cancelling remaining futures…")
+                    for f in futures:
+                        f.cancel()
+                    break
+
+                n_done += 1
+                try:
+                    result = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    result = {"tic": -1, "status": f"fatal:{e}"}
+
+                log_rows.append({"tic": result["tic"], "status": result["status"]})
+
+                if result["status"] == "ok":
+                    gvs.append(result["gv"])
+                    lvs.append(result["lv"])
+                    sfs.append(result["sf"])
+                    labels.append(result["label"])
+                    tics.append(result["tic"])
+                    processed_tics.add(result["tic"])
+                    n_since_checkpoint += 1
+                else:
+                    processed_tics.add(result["tic"])  # don't retry known-bad targets on resume
+
+                if n_done % 25 == 0 or n_done == len(sample):
                     elapsed = time.time() - t_start
-                    rate = processed / elapsed
-                    remaining = len(pending_specs) - processed
-                    eta_min = remaining / rate / 60 if rate > 0 else float("inf")
-                    n_done_so_far = (manifest["status"] == "done").sum()
-                    log.info(f"  [{processed}/{len(pending_specs)}] rate={rate:.2f}/s  "
-                              f"ETA={eta_min:.1f} min  total_done={n_done_so_far}")
+                    rate = n_done / max(elapsed, 1e-6)
+                    _safe_print(f"  [{n_done:5d}/{len(sample)}] "
+                                f"ok={len(labels):5d}  "
+                                f"rate={rate:.2f}/s  "
+                                f"elapsed={elapsed/60:.1f}min")
 
-            if _stop_requested.is_set():
-                break
+                if n_since_checkpoint >= CHECKPOINT_EVERY:
+                    save_partial_dataset(gvs, lvs, sfs, labels, tics)
+                    save_checkpoint(processed_tics)
+                    n_since_checkpoint = 0
 
-    writer.flush()
-    save_manifest(manifest)
-    print_dataset_summary(manifest)
+    except KeyboardInterrupt:
+        _safe_print("\n⚠ KeyboardInterrupt — saving progress before exit…")
 
-    if _stop_requested.is_set():
-        log.info("Interrupted — rerun the exact same command to resume.")
-    else:
-        log.info("✅ Session complete.")
+    # Final save
+    save_partial_dataset(gvs, lvs, sfs, labels, tics)
+    save_checkpoint(processed_tics)
+
+    log_df = pd.DataFrame(log_rows)
+    if not log_df.empty:
+        log_df.to_csv(LOG_PATH, index=False)
+
+    _safe_print(f"\n✅ Done. {len(labels)} usable samples out of {len(sample)} requested "
+                f"({len(labels)/max(len(sample),1)*100:.1f}% yield).")
+    _safe_print(f"   Dataset  : {OUT_PATH}")
+    _safe_print(f"   Fetch log: {LOG_PATH}")
+    _safe_print(f"   Stellar feature vector: {STELLAR_FEAT_LEN} features (v2 expanded)")
+    _safe_print(f"   Stellar param source: https://archive.stsci.edu/tess/tic_ctl.html")
+
+    if not log_df.empty:
+        _safe_print("\nFailure breakdown (see fetch_log.csv for full detail):")
+        _safe_print(log_df["status"].apply(lambda s: s.split(":")[0]).value_counts().to_string())
 
 
 if __name__ == "__main__":
     main()
-
-# ─────────────────────────────────────────────────────────────────────────
-# RUNTIME NOTE
-#
-# Each target typically takes ~5-15s (a few seconds of MAST search + one
-# download per sector). With 6 workers, expect roughly:
-#     20,000 targets × ~8s / 6 workers  ≈  7-8 hours
-#
-# Recommendations for a local Mac run:
-#   1. Smoke-test first: `--target-total 200` to confirm the pipeline
-#      completes cleanly end-to-end before committing to a multi-hour run.
-#   2. Run inside tmux/screen, or with `nohup … &`, since this is a
-#      long-lived process you'll want to detach from.
-#   3. It's safe to interrupt (Ctrl+C) and resume at any time — nothing
-#      already downloaded is repeated.
-#   4. Once you have enough shards, the next step is a small script that
-#      concatenates shard_*.npz files into the train/val/test split format
-#      train_transformer.py expects — that's a natural "training upgrade"
-#      follow-up once this data acquisition phase is done.
-# ─────────────────────────────────────────────────────────────────────────

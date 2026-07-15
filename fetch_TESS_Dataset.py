@@ -311,9 +311,11 @@ def _fetch_tic_params_xctl_csv() -> pd.DataFrame:
         _safe_print(f"\n  ✅ Download complete: {XCTL_PATH}")
 
     _safe_print("  Reading xCTL × TIC CSV (this may take a minute for ~9.5 GB)…")
-    # Only read the columns we need to save memory
-    usecols = ["ID", "Teff", "rad", "logg", "Tmag"]
-    df = pd.read_csv(XCTL_PATH, usecols=usecols, low_memory=False)
+    # Only read the columns we need to save memory.
+    # The CSV has no header row, so we use exact column indices:
+    # ID: 0, Tmag: 60, Teff: 64, logg: 66, rad: 70
+    df = pd.read_csv(XCTL_PATH, header=None, usecols=[0, 60, 64, 66, 70], low_memory=False)
+    df.columns = ["ID", "Tmag", "Teff", "logg", "rad"]
     _safe_print(f"  Loaded {len(df)} TIC entries from xCTL × TIC catalog")
     return df
 

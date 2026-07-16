@@ -386,7 +386,7 @@ def plot_reliability_diagram(probs, labels, out_path, title="Reliability Diagram
 def main():
     parser = argparse.ArgumentParser(description="Train ExoDetectCNN on TESS data")
     parser.add_argument("--data", type=Path,
-                         default=Path("/Volumes/Expansion/EXO_Datasets/tess_data/tess_lcs/exo_CTL_08.01xTIC_v8.1.csv"),
+                         default=Path("/Volumes/Expansion/EXO_Datasets/tess_data/tess_lcs/dataset.npz"),
                          help="Path to dataset.npz produced by fetch_tess_dataset.py "
                               "(defaults to that script's own DATA_DIR)")
     parser.add_argument("--out", type=Path,

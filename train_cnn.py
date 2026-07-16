@@ -91,15 +91,23 @@ def get_device():
 class ConvBlock(nn.Module):
     def __init__(self, ic, oc, k=5, p=2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(ic, oc, k, padding=k // 2),
-            nn.BatchNorm1d(oc),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(p),
-        )
+        self.conv = nn.Conv1d(ic, oc, k, padding=k // 2)
+        self.bn = nn.BatchNorm1d(oc)
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool1d(p)
+        
+        self.shortcut = nn.Sequential()
+        if ic != oc:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(ic, oc, 1),
+                nn.BatchNorm1d(oc)
+            )
 
     def forward(self, x):
-        return self.net(x)
+        out = self.bn(self.conv(x))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return self.pool(out)
 
 class SafeAdaptiveAvgPool1d(nn.Module):
     """
@@ -190,9 +198,14 @@ class TransitCNNDataset(Dataset):
         if self.augment:
             gv = gv + torch.randn_like(gv) * 0.01          # gaussian noise
             lv = lv + torch.randn_like(lv) * 0.01
-            shift = int(torch.randint(0, len(gv), (1,)).item())
-            gv = torch.roll(gv, shift)                       # phase shift
             gv = gv * (1 + 0.02 * torch.randn(1).item())      # amplitude jitter
+            
+            # CutOut augmentation
+            if torch.rand(1).item() < 0.5:
+                cut_len = int(len(gv) * 0.1)
+                start = torch.randint(0, len(gv) - cut_len, (1,)).item()
+                gv[start:start+cut_len] = 0.0
+                
         return gv.unsqueeze(0), lv.unsqueeze(0), sf, y   # (1, 201), (1, 81), (n_stellar,), scalar
 
 
@@ -244,13 +257,42 @@ def make_loaders(gv, lv, sf, y, idx_trn, idx_val, batch_size):
 
 # ── Training ─────────────────────────────────────────────────────────────
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(reduction='none', label_smoothing=label_smoothing)
+
+    def forward(self, inputs, targets):
+        ce_loss = self.ce(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+def mixup_data(gv, lv, sf, y, alpha=0.2):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = gv.size(0)
+    index = torch.randperm(batch_size).to(gv.device)
+    
+    mixed_gv = lam * gv + (1 - lam) * gv[index, :]
+    mixed_lv = lam * lv + (1 - lam) * lv[index, :]
+    mixed_sf = lam * sf + (1 - lam) * sf[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_gv, mixed_lv, mixed_sf, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
 def train_one_model(gv, lv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag="fold0"):
     """Trains one ExoDetectCNN to convergence with early stopping.
     Returns (model_with_best_weights, history, best_val_auc, best_epoch)."""
     dl_trn, dl_val = make_loaders(gv, lv, sf, y, idx_trn, idx_val, args.batch_size)
 
     model = build_cnn(n_stellar=n_stellar, device=device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=args.lr * 5, steps_per_epoch=len(dl_trn),
@@ -268,9 +310,11 @@ def train_one_model(gv, lv, sf, y, idx_trn, idx_val, args, device, n_stellar, ta
             gv_b, lv_b, sf_b, y_b = (
                 gv_b.to(device), lv_b.to(device), sf_b.to(device), y_b.to(device)
             )
+            gv_b, lv_b, sf_b, y_a, y_b, lam = mixup_data(gv_b, lv_b, sf_b, y_b, alpha=0.2)
+            
             optimizer.zero_grad()
             logits = model(gv_b, lv_b, sf_b)
-            loss = criterion(logits, y_b)
+            loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()

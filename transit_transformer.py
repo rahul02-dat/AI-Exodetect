@@ -77,27 +77,26 @@ class PositionalEncoding(nn.Module):
 
 class PatchEmbedding(nn.Module):
     """
-    Split the 1D light curve into non-overlapping patches,
-    then linearly project each patch to d_model dimensions.
+    Split the 1D light curve into overlapping patches using 1D convolution,
+    which helps maintain local continuity across patch boundaries.
 
     light_curve: (B, 1, L)  →  patches: (B, n_patches, d_model)
-
-    This is the 1D analogue of Vision Transformer patch embeddings.
     """
     def __init__(self, seq_len, patch_size, d_model):
         super().__init__()
-        assert seq_len % patch_size == 0, \
-            f"seq_len ({seq_len}) must be divisible by patch_size ({patch_size})"
-        self.n_patches  = seq_len // patch_size
         self.patch_size = patch_size
-        self.proj = nn.Linear(patch_size, d_model)
+        
+        # Overlapping patches: stride < patch_size
+        stride = max(1, patch_size // 2)
+        self.proj = nn.Conv1d(1, d_model, kernel_size=patch_size, stride=stride)
+        
+        # Calculate resulting number of patches
+        self.n_patches = ((seq_len - patch_size) // stride) + 1
 
     def forward(self, x):
         # x: (B, 1, L)
-        B, _, L = x.shape
-        # Reshape into patches: (B, n_patches, patch_size)
-        x = x.squeeze(1).reshape(B, self.n_patches, self.patch_size)
-        return self.proj(x)   # (B, n_patches, d_model)
+        x = self.proj(x)          # (B, d_model, n_patches)
+        return x.transpose(1, 2)  # (B, n_patches, d_model)
 
 
 # ── Transformer Encoder with Attention Export ──────────────────────────────
@@ -198,7 +197,8 @@ class TransitFormer(nn.Module):
         super().__init__()
         self.seq_len    = seq_len
         self.patch_size = patch_size
-        self.n_patches  = seq_len // patch_size
+        stride = max(1, patch_size // 2)
+        self.n_patches = ((seq_len - patch_size) // stride) + 1
         self.n_stellar  = n_stellar
 
         # Patch embedding

@@ -87,10 +87,23 @@ def _get_worker_models():
     class ConvBlock(nn.Module):
         def __init__(self, ic, oc, k=5, p=2):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv1d(ic, oc, k, padding=k//2),
-                nn.BatchNorm1d(oc), nn.ReLU(True), nn.MaxPool1d(p))
-        def forward(self, x): return self.net(x)
+            self.conv = nn.Conv1d(ic, oc, k, padding=k // 2)
+            self.bn = nn.BatchNorm1d(oc)
+            self.relu = nn.ReLU(inplace=True)
+            self.pool = nn.MaxPool1d(p)
+            
+            self.shortcut = nn.Sequential()
+            if ic != oc:
+                self.shortcut = nn.Sequential(
+                    nn.Conv1d(ic, oc, 1),
+                    nn.BatchNorm1d(oc)
+                )
+
+        def forward(self, x):
+            out = self.bn(self.conv(x))
+            out += self.shortcut(x)
+            out = self.relu(out)
+            return self.pool(out)
 
     class SafeAdaptiveAvgPool1d(nn.Module):
         def __init__(self, output_size):

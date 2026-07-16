@@ -101,7 +101,6 @@ class TransitDataset(Dataset):
         gv, sf, y = self.gv[idx], self.sf[idx], self.y[idx]
         if self.augment:
             gv = gv + torch.randn_like(gv) * 0.01              # gaussian noise
-            gv = torch.roll(gv, int(torch.randint(0, len(gv), (1,)).item()))  # phase shift
             gv = gv * (1 + 0.02 * torch.randn(1).item())        # amplitude jitter
         return gv.unsqueeze(0), sf, y   # (1, L), (4,) or (8,), scalar
 
@@ -141,6 +140,34 @@ def make_loaders(gv, sf, y, idx_trn, idx_val, batch_size):
 
 # ── Training ─────────────────────────────────────────────────────────────
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(reduction='none', label_smoothing=label_smoothing)
+
+    def forward(self, inputs, targets):
+        ce_loss = self.ce(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+def mixup_data(gv, sf, y, alpha=0.2):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = gv.size(0)
+    index = torch.randperm(batch_size).to(gv.device)
+    
+    mixed_gv = lam * gv + (1 - lam) * gv[index, :]
+    mixed_sf = lam * sf + (1 - lam) * sf[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_gv, mixed_sf, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
 def train_one_model(gv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag="fold0"):
     """Trains one TransitFormer to convergence with early stopping.
     Returns (model_with_best_weights, history, best_val_auc, best_epoch)."""
@@ -148,7 +175,7 @@ def train_one_model(gv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag="f
 
     model = build_transformer(seq_len=GLOBAL_LEN, patch_size=PATCH_SIZE,
                                n_stellar=n_stellar, device=device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -161,9 +188,11 @@ def train_one_model(gv, sf, y, idx_trn, idx_val, args, device, n_stellar, tag="f
         trn_loss = 0.0
         for gv_b, sf_b, y_b in dl_trn:
             gv_b, sf_b, y_b = gv_b.to(device), sf_b.to(device), y_b.to(device)
+            gv_b, sf_b, y_a, y_b, lam = mixup_data(gv_b, sf_b, y_b, alpha=0.2)
+            
             optimizer.zero_grad()
             logits, _ = model(gv_b, sf_b, return_attn=False)
-            loss = criterion(logits, y_b)
+            loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()

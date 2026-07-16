@@ -92,6 +92,15 @@ def _get_worker_models():
                 nn.BatchNorm1d(oc), nn.ReLU(True), nn.MaxPool1d(p))
         def forward(self, x): return self.net(x)
 
+    class SafeAdaptiveAvgPool1d(nn.Module):
+        def __init__(self, output_size):
+            super().__init__()
+            self.pool = nn.AdaptiveAvgPool1d(output_size)
+        def forward(self, x):
+            if x.device.type == "mps":
+                return self.pool(x.cpu()).to(x.device)
+            return self.pool(x)
+
     class ExoDetectCNN(nn.Module):
         def __init__(self, global_len=201, local_len=81, n_stellar=4):
             super().__init__()
@@ -100,10 +109,10 @@ def _get_worker_models():
             self.gb = nn.Sequential(
                 ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
                 ConvBlock(32,64,5,2), ConvBlock(64,128,3,2),
-                nn.AdaptiveAvgPool1d(8), nn.Flatten())
+                SafeAdaptiveAvgPool1d(8), nn.Flatten())
             self.lb = nn.Sequential(
                 ConvBlock(1,16,5,2), ConvBlock(16,32,5,2),
-                ConvBlock(32,64,3,2), nn.AdaptiveAvgPool1d(4), nn.Flatten())
+                ConvBlock(32,64,3,2), SafeAdaptiveAvgPool1d(4), nn.Flatten())
             fused = (128*8) + (64*4) + n_stellar
             self.head = nn.Sequential(
                 nn.Linear(fused,512), nn.ReLU(True), nn.Dropout(0.5),

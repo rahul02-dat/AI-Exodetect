@@ -101,6 +101,20 @@ class ConvBlock(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class SafeAdaptiveAvgPool1d(nn.Module):
+    """
+    Wrapper around nn.AdaptiveAvgPool1d to avoid MPS non-divisible size errors.
+    Automatically moves tensors to CPU for the pooling operation if on MPS.
+    """
+    def __init__(self, output_size):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(output_size)
+        
+    def forward(self, x):
+        if x.device.type == 'mps':
+            return self.pool(x.cpu()).to(x.device)
+        return self.pool(x)
+
 
 class ExoDetectCNN(nn.Module):
     """Dual-branch 1D CNN — global (full-orbit, 201 bins) + local (transit
@@ -113,11 +127,11 @@ class ExoDetectCNN(nn.Module):
         self.global_branch = nn.Sequential(
             ConvBlock(1, 16, 5, 2), ConvBlock(16, 32, 5, 2),
             ConvBlock(32, 64, 5, 2), ConvBlock(64, 128, 3, 2),
-            nn.AdaptiveAvgPool1d(8), nn.Flatten(),
+            SafeAdaptiveAvgPool1d(8), nn.Flatten(),
         )
         self.local_branch = nn.Sequential(
             ConvBlock(1, 16, 5, 2), ConvBlock(16, 32, 5, 2),
-            ConvBlock(32, 64, 3, 2), nn.AdaptiveAvgPool1d(4), nn.Flatten(),
+            ConvBlock(32, 64, 3, 2), SafeAdaptiveAvgPool1d(4), nn.Flatten(),
         )
         fused = (128 * 8) + (64 * 4) + n_stellar
         self.head = nn.Sequential(

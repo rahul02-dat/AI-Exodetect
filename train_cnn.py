@@ -293,10 +293,12 @@ def train_one_model(gv, lv, sf, y, idx_trn, idx_val, args, device, n_stellar, ta
 
     model = build_cnn(n_stellar=n_stellar, device=device)
     criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=3e-4)  # was 1e-4
     scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=args.lr * 5, steps_per_epoch=len(dl_trn),
-        epochs=args.epochs, pct_start=0.1,
+        optimizer, max_lr=args.lr * 2,        # was *5 — too hot for ~2k samples
+        steps_per_epoch=len(dl_trn),
+        epochs=args.epochs, pct_start=0.25,   # longer warmup
+        div_factor=10, final_div_factor=100,
     )
 
     history = {"trn_loss": [], "val_loss": [], "val_auc": []}
@@ -437,8 +439,8 @@ def main():
                          default=Path(__file__).parent / "exodetect_cnn.pt")
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1.5e-4)   # was 3e-4
+    parser.add_argument("--patience", type=int, default=15) 
     parser.add_argument("--kfold", type=int, default=1,
                          help="1 = single 70/15/15 split (default, fast). "
                               ">1 = stratified k-fold CV over train+val, evaluated "

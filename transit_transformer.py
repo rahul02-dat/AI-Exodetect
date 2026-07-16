@@ -137,7 +137,9 @@ class AttentionLayer(nn.Module):
 
 
 class TransformerEncoderBlock(nn.Module):
-    def __init__(self, d_model, n_heads, ff_dim, dropout=0.1):
+    def __init__(self, seq_len=201, local_len=81, patch_size=3,
+                 local_patch_size=3, d_model=64, n_heads=4, n_layers=4,
+                 ff_dim=256, n_stellar=4, dropout=0.1, n_classes=2):
         super().__init__()
         self.attn   = AttentionLayer(d_model, n_heads, dropout)
         self.norm1  = nn.LayerNorm(d_model)
@@ -149,8 +151,20 @@ class TransformerEncoderBlock(nn.Module):
             nn.Linear(ff_dim, d_model),
             nn.Dropout(dropout),
         )
+        self.local_embed = PatchEmbedding(local_len, local_patch_size, d_model)
+        stride_l = max(1, local_patch_size // 2)
+        self.n_local_patches = ((local_len - local_patch_size) // stride_l) + 1
+        # extend positional encoding to cover CLS + global patches + local patches
+        self.pos_enc = PositionalEncoding(
+            d_model, max_len=self.n_patches + self.n_local_patches + 1, dropout=dropout)
 
-    def forward(self, x, return_attn=False):
+    def forward(self, global_view, local_view, stellar_feats, return_attn=False):
+        B = global_view.size(0)
+        x_g = self.patch_embed(global_view)
+        x_l = self.local_embed(local_view)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x_g, x_l], dim=1)
+        x = self.pos_enc(x)
         attn_out, attn_weights = self.attn(self.norm1(x), return_attn=return_attn)
         x = x + attn_out
         x = x + self.ff(self.norm2(x))
